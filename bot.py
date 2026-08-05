@@ -322,4 +322,4 @@ if __name__ == "__main__":
             "Erreur : la variable d'environnement DISCORD_TOKEN n'est pas définie.\n"
             "Copie .env.example en .env et renseigne ton token de bot."
         )
-    bot.run(TOKEN)
+    bot.run(os.getenv("DISCORD_TOKEN"))
