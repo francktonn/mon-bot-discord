@@ -31,19 +31,23 @@ L'XP est calculée automatiquement à partir des messages et du temps de vocal
 d'XP, visible sur `/profil view` et `/profil classement` (aucune annonce
 publique n'est envoyée lors d'un passage de niveau).
 
-Les données sont stockées dans une base SQLite locale (profiles.db),
-un profil par (serveur, utilisateur) donc chaque serveur a ses propres profils.
+Les données sont stockées dans une base PostgreSQL externe (Neon, Supabase, ou
+tout autre Postgres compatible), configurée via la variable d'environnement
+DATABASE_URL. Contrairement à un fichier SQLite local, cette base survit aux
+redéploiements et redémarrages, même sur les hébergeurs sans disque persistant
+(comme Render en plan gratuit). Un profil par (serveur, utilisateur) donc
+chaque serveur a ses propres profils.
 """
 
 import os
-import sqlite3
 import re
 import time
 import asyncio
 import math
-from contextlib import closing
+from contextlib import contextmanager
 
 import discord
+import psycopg2
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -52,7 +56,10 @@ from aiohttp import web
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-DB_PATH = os.path.join(os.path.dirname(__file__), "profiles.db")
+# URL de connexion à la base Postgres (fournie par Neon, Supabase, Render Postgres...).
+# Contrairement à un fichier SQLite local, une base externe survit aux redémarrages
+# et redéploiements, même sur les plans gratuits sans disque persistant.
+DATABASE_URL = os.getenv("DATABASE_URL")
 MAX_LINKS = 5
 MAX_BIO_LEN = 500
 EMBED_COLOR = 0x5865F2  # blurple (couleur par défaut si aucune n'est choisie)
@@ -66,16 +73,39 @@ URL_REGEX = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
-# Base de données
+# Base de données (PostgreSQL, hébergée en externe pour survivre aux redéploiements)
 # ---------------------------------------------------------------------------
 
+@contextmanager
+def get_db():
+    """Ouvre une connexion Postgres pour la durée du bloc `with`, la valide
+    (commit) si tout s'est bien passé, l'annule (rollback) sinon, puis la
+    referme. Une nouvelle connexion à chaque appel est volontaire : ça évite
+    les soucis de connexions "mortes" quand la base se met en veille
+    (ex : Neon en scale-to-zero) entre deux actions du bot."""
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "La variable d'environnement DATABASE_URL n'est pas définie. "
+            "Configure-la avec l'URL de connexion de ta base Postgres (voir le README)."
+        )
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def init_db():
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        db.execute(
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
             """
             CREATE TABLE IF NOT EXISTS profiles (
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
                 bio TEXT,
                 avatar_url TEXT,
                 message_count INTEGER NOT NULL DEFAULT 0,
@@ -85,11 +115,11 @@ def init_db():
             )
             """
         )
-        db.execute(
+        cur.execute(
             """
             CREATE TABLE IF NOT EXISTS links (
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
                 label TEXT NOT NULL,
                 url TEXT NOT NULL,
                 position INTEGER NOT NULL,
@@ -97,47 +127,49 @@ def init_db():
             )
             """
         )
-        # Migration légère pour les bases créées avec une version antérieure du bot
-        # (ajoute les colonnes manquantes sans perdre les données existantes).
-        existing_columns = {row[1] for row in db.execute("PRAGMA table_info(profiles)")}
-        if "message_count" not in existing_columns:
-            db.execute("ALTER TABLE profiles ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0")
-        if "voice_seconds" not in existing_columns:
-            db.execute("ALTER TABLE profiles ADD COLUMN voice_seconds INTEGER NOT NULL DEFAULT 0")
-        if "profile_color" not in existing_columns:
-            db.execute("ALTER TABLE profiles ADD COLUMN profile_color INTEGER")
-        db.commit()
+        # Migration légère pour les bases créées avec une version antérieure du bot.
+        # Postgres gère nativement "IF NOT EXISTS", plus besoin de vérifier à la main.
+        cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS message_count INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS voice_seconds INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS profile_color INTEGER")
 
 
 def get_or_create_profile(guild_id: int, user_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        db.execute(
-            "INSERT OR IGNORE INTO profiles (guild_id, user_id) VALUES (?, ?)",
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO profiles (guild_id, user_id) VALUES (%s, %s) "
+            "ON CONFLICT (guild_id, user_id) DO NOTHING",
             (guild_id, user_id),
         )
-        db.commit()
 
 
-def update_field(guild_id: int, user_id: int, field: str, value: str):
+# Liste blanche des colonnes modifiables via update_field, pour éviter toute
+# injection SQL par le nom de colonne (celui-ci ne peut pas être paramétré
+# comme une valeur classique).
+_EDITABLE_FIELDS = {"bio", "avatar_url", "profile_color"}
+
+
+def update_field(guild_id: int, user_id: int, field: str, value):
+    if field not in _EDITABLE_FIELDS:
+        raise ValueError(f"Champ non autorisé : {field}")
     get_or_create_profile(guild_id, user_id)
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        db.execute(
-            f"UPDATE profiles SET {field} = ? WHERE guild_id = ? AND user_id = ?",
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            f"UPDATE profiles SET {field} = %s WHERE guild_id = %s AND user_id = %s",
             (value, guild_id, user_id),
         )
-        db.commit()
 
 
 def fetch_profile(guild_id: int, user_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        cur = db.execute(
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
             "SELECT bio, avatar_url, message_count, voice_seconds, profile_color "
-            "FROM profiles WHERE guild_id = ? AND user_id = ?",
+            "FROM profiles WHERE guild_id = %s AND user_id = %s",
             (guild_id, user_id),
         )
         row = cur.fetchone()
-        cur = db.execute(
-            "SELECT label, url FROM links WHERE guild_id = ? AND user_id = ? ORDER BY position ASC",
+        cur.execute(
+            "SELECT label, url FROM links WHERE guild_id = %s AND user_id = %s ORDER BY position ASC",
             (guild_id, user_id),
         )
         links = cur.fetchall()
@@ -146,9 +178,9 @@ def fetch_profile(guild_id: int, user_id: int):
 
 def fetch_all_profiles(guild_id: int) -> list[tuple[int, int, int]]:
     """Renvoie (user_id, message_count, voice_seconds) pour tous les profils d'un serveur."""
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        cur = db.execute(
-            "SELECT user_id, message_count, voice_seconds FROM profiles WHERE guild_id = ?",
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "SELECT user_id, message_count, voice_seconds FROM profiles WHERE guild_id = %s",
             (guild_id,),
         )
         return cur.fetchall()
@@ -156,24 +188,22 @@ def fetch_all_profiles(guild_id: int) -> list[tuple[int, int, int]]:
 
 def increment_message_count(guild_id: int, user_id: int):
     get_or_create_profile(guild_id, user_id)
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        db.execute(
-            "UPDATE profiles SET message_count = message_count + 1 WHERE guild_id = ? AND user_id = ?",
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "UPDATE profiles SET message_count = message_count + 1 WHERE guild_id = %s AND user_id = %s",
             (guild_id, user_id),
         )
-        db.commit()
 
 
 def add_voice_seconds(guild_id: int, user_id: int, seconds: int):
     if seconds <= 0:
         return
     get_or_create_profile(guild_id, user_id)
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        db.execute(
-            "UPDATE profiles SET voice_seconds = voice_seconds + ? WHERE guild_id = ? AND user_id = ?",
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "UPDATE profiles SET voice_seconds = voice_seconds + %s WHERE guild_id = %s AND user_id = %s",
             (seconds, guild_id, user_id),
         )
-        db.commit()
 
 
 def format_duration(total_seconds: int) -> str:
@@ -224,14 +254,14 @@ def level_progress(xp: int) -> tuple[int, int, int]:
 
 def add_link(guild_id: int, user_id: int, label: str, url: str) -> tuple[bool, str]:
     get_or_create_profile(guild_id, user_id)
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        cur = db.execute(
-            "SELECT COUNT(*) FROM links WHERE guild_id = ? AND user_id = ?",
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM links WHERE guild_id = %s AND user_id = %s",
             (guild_id, user_id),
         )
         count = cur.fetchone()[0]
-        cur = db.execute(
-            "SELECT 1 FROM links WHERE guild_id = ? AND user_id = ? AND label = ?",
+        cur.execute(
+            "SELECT 1 FROM links WHERE guild_id = %s AND user_id = %s AND label = %s",
             (guild_id, user_id, label),
         )
         exists = cur.fetchone() is not None
@@ -239,33 +269,30 @@ def add_link(guild_id: int, user_id: int, label: str, url: str) -> tuple[bool, s
         if not exists and count >= MAX_LINKS:
             return False, f"Tu as déjà atteint le maximum de {MAX_LINKS} liens. Supprime-en un d'abord."
 
-        db.execute(
+        cur.execute(
             """
             INSERT INTO links (guild_id, user_id, label, url, position)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(guild_id, user_id, label) DO UPDATE SET url = excluded.url
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (guild_id, user_id, label) DO UPDATE SET url = EXCLUDED.url
             """,
             (guild_id, user_id, label, url, count),
         )
-        db.commit()
     return True, "ok"
 
 
 def remove_link(guild_id: int, user_id: int, label: str) -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        cur = db.execute(
-            "DELETE FROM links WHERE guild_id = ? AND user_id = ? AND label = ?",
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM links WHERE guild_id = %s AND user_id = %s AND label = %s",
             (guild_id, user_id, label),
         )
-        db.commit()
         return cur.rowcount > 0
 
 
 def delete_profile(guild_id: int, user_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        db.execute("DELETE FROM profiles WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-        db.execute("DELETE FROM links WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-        db.commit()
+    with get_db() as db, db.cursor() as cur:
+        cur.execute("DELETE FROM profiles WHERE guild_id = %s AND user_id = %s", (guild_id, user_id))
+        cur.execute("DELETE FROM links WHERE guild_id = %s AND user_id = %s", (guild_id, user_id))
 
 
 # ---------------------------------------------------------------------------
@@ -740,5 +767,11 @@ if __name__ == "__main__":
         raise SystemExit(
             "Erreur : la variable d'environnement DISCORD_TOKEN n'est pas définie.\n"
             "Copie .env.example en .env et renseigne ton token de bot."
+        )
+    if not DATABASE_URL:
+        raise SystemExit(
+            "Erreur : la variable d'environnement DATABASE_URL n'est pas définie.\n"
+            "Crée une base Postgres gratuite (ex: Neon.tech) et colle son URL de connexion "
+            "dans le fichier .env. Voir le README pour le guide pas à pas."
         )
     bot.run(TOKEN)
