@@ -12,11 +12,11 @@ Permet à chaque membre d'un serveur de se créer une petite fiche de profil :
 - un système de niveaux/XP basé sur l'activité (messages + vocal)
 
 Commandes slash (/) :
-    /profil editer     -> ouvre un menu déroulant pour créer/modifier son profil
+    /profil editor     -> ouvre un menu déroulant pour créer/modifier son profil
                            (bio, photo, couleur, liens, suppression) via des
                            sous-menus et des formulaires (modals), sans avoir
                            à mémoriser de commandes séparées.
-    /profil voir [membre]      -> afficher le profil (le sien ou celui d'un autre membre)
+    /profil view [membre]      -> afficher le profil (le sien ou celui d'un autre membre)
     /profil classement [critere] -> afficher le top 10 du serveur (XP, messages ou vocal)
 
 Le compteur de messages s'incrémente automatiquement à chaque message envoyé
@@ -28,7 +28,7 @@ réinitialisent pas le chrono, seule une déconnexion complète l'arrête).
 
 L'XP est calculée automatiquement à partir des messages et du temps de vocal
 (pas de colonne séparée à maintenir) ; un niveau est débloqué tous les paliers
-d'XP, visible sur `/profil voir` et `/profil classement` (aucune annonce
+d'XP, visible sur `/profil view` et `/profil classement` (aucune annonce
 publique n'est envoyée lors d'un passage de niveau).
 
 Les données sont stockées dans une base SQLite locale (profiles.db),
@@ -636,10 +636,10 @@ class ProfileEditView(discord.ui.View):
         self.add_item(ProfileEditSelect(guild_id, user_id))
 
 
-# ---- /profil editer -----------------------------------------------------------
+# ---- /profil editor -----------------------------------------------------------
 
-@profil_group.command(name="editer", description="Ouvre un menu pour créer ou modifier ton profil")
-async def profil_editer(interaction: discord.Interaction):
+@profil_group.command(name="editor", description="Ouvre un menu pour créer ou modifier ton profil")
+async def profil_editor(interaction: discord.Interaction):
     view = ProfileEditView(interaction.guild_id, interaction.user.id)
     await interaction.response.send_message(
         "🛠️ **Édition de ton profil**\nChoisis ce que tu veux modifier dans le menu ci-dessous :",
@@ -648,18 +648,18 @@ async def profil_editer(interaction: discord.Interaction):
     )
 
 
-# ---- /profil voir -----------------------------------------------------------
+# ---- /profil view -----------------------------------------------------------
 
-@profil_group.command(name="voir", description="Affiche ton profil ou celui d'un autre membre")
+@profil_group.command(name="view", description="Affiche ton profil ou celui d'un autre membre")
 @app_commands.describe(membre="Le membre dont tu veux voir le profil (optionnel)")
-async def profil_voir(interaction: discord.Interaction, membre: discord.Member = None):
+async def profil_view(interaction: discord.Interaction, membre: discord.Member = None):
     target = membre or interaction.user
     row, links = fetch_profile(interaction.guild_id, target.id)
 
     if row is None and not links:
         if target == interaction.user:
             await interaction.response.send_message(
-                "Tu n'as pas encore de profil. Utilise `/profil editer` pour en créer un !",
+                "Tu n'as pas encore de profil. Utilise `/profil editor` pour en créer un !",
                 ephemeral=True,
             )
         else:
