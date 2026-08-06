@@ -6,7 +6,7 @@ Permet à chaque membre d'un serveur de se créer une petite fiche de profil :
 - une photo de profil (image)
 - une couleur de profil personnalisée
 - une bio (texte)
-- des liens utiles (ex: Twitter, portfolio, twitch...)
+- des liens Letterboxd et/ou AniList (max 2, un par service)
 - un compteur du nombre de messages envoyés sur le serveur
 - un temps total passé en vocal sur le serveur
 - un système de niveaux/XP basé sur l'activité (messages + vocal)
@@ -60,16 +60,49 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 # Contrairement à un fichier SQLite local, une base externe survit aux redémarrages
 # et redéploiements, même sur les plans gratuits sans disque persistant.
 DATABASE_URL = os.getenv("DATABASE_URL")
-MAX_LINKS = 5
+MAX_LINKS = 2
 MAX_BIO_LEN = 500
 EMBED_COLOR = 0x5865F2  # blurple (couleur par défaut si aucune n'est choisie)
+
+# Seuls ces deux services sont acceptés comme liens de profil (un lien par service).
+LINK_SERVICES = {
+    "letterboxd": {
+        "label": "Letterboxd",
+        "domain": "letterboxd.com",
+        "emoji": "🎬",
+        "url_template": "https://letterboxd.com/{username}/",
+    },
+    "anilist": {
+        "label": "AniList",
+        "domain": "anilist.co",
+        "emoji": "📺",
+        "url_template": "https://anilist.co/user/{username}/",
+    },
+}
 
 # Système de niveaux / XP : l'XP est dérivée des statistiques déjà suivies,
 # pas besoin de colonne supplémentaire pour la stocker.
 XP_PER_MESSAGE = 10
 XP_PER_VOICE_MINUTE = 5
 
-URL_REGEX = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+
+def resolve_link_url(service_key: str, raw_input: str) -> tuple[str | None, str | None]:
+    """Construit/valide l'URL d'un lien Letterboxd ou AniList à partir de ce que
+    l'utilisateur a tapé (un simple pseudo, ou une URL complète). Renvoie
+    (url, None) si c'est valide, ou (None, message_erreur) sinon."""
+    service = LINK_SERVICES[service_key]
+    raw_input = raw_input.strip()
+
+    if raw_input.lower().startswith(("http://", "https://")):
+        if service["domain"] not in raw_input.lower():
+            return None, f"Cette URL ne pointe pas vers {service['domain']}."
+        return raw_input, None
+
+    # Sinon, on considère que c'est un simple pseudo et on construit l'URL nous-mêmes.
+    username = raw_input.strip("/ ")
+    if not username or not re.fullmatch(r"[A-Za-z0-9_\-]{1,50}", username):
+        return None, "Pseudo invalide (lettres, chiffres, tirets et underscores uniquement)."
+    return service["url_template"].format(username=username), None
 
 
 # ---------------------------------------------------------------------------
@@ -452,34 +485,54 @@ class BioModal(discord.ui.Modal, title="Modifier ma bio"):
         await interaction.response.send_message("Ta bio a été mise à jour ✅", ephemeral=True)
 
 
-class LinkAddModal(discord.ui.Modal, title="Ajouter un lien"):
-    nom_input = discord.ui.TextInput(
-        label="Nom du lien", max_length=50, placeholder="ex: Twitter, Portfolio, Twitch..."
-    )
-    url_input = discord.ui.TextInput(
-        label="URL", max_length=200, placeholder="https://..."
+class LinkServiceModal(discord.ui.Modal):
+    pseudo_input = discord.ui.TextInput(
+        label="Pseudo ou URL",
+        max_length=200,
+        placeholder="ex: tonpseudo ou https://...",
     )
 
-    def __init__(self, guild_id: int, user_id: int):
-        super().__init__()
+    def __init__(self, guild_id: int, user_id: int, service_key: str):
+        service = LINK_SERVICES[service_key]
+        super().__init__(title=f"Lien {service['label']}")
         self.guild_id = guild_id
         self.user_id = user_id
+        self.service_key = service_key
+        self.pseudo_input.label = f"Pseudo ou URL {service['label']}"
 
     async def on_submit(self, interaction: discord.Interaction):
-        nom = str(self.nom_input.value).strip()
-        url = str(self.url_input.value).strip()
-
-        if not URL_REGEX.match(url):
-            await interaction.response.send_message(
-                "L'URL doit commencer par http:// ou https://", ephemeral=True
-            )
+        service = LINK_SERVICES[self.service_key]
+        url, error = resolve_link_url(self.service_key, str(self.pseudo_input.value))
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
             return
 
-        ok, msg = add_link(self.guild_id, self.user_id, nom, url)
+        ok, msg = add_link(self.guild_id, self.user_id, service["label"], url)
         if not ok:
             await interaction.response.send_message(msg, ephemeral=True)
             return
-        await interaction.response.send_message(f"Lien **{nom}** ajouté ✅", ephemeral=True)
+        await interaction.response.send_message(f"Lien **{service['label']}** enregistré ✅", ephemeral=True)
+
+
+class LinkServiceSelect(discord.ui.Select):
+    def __init__(self, guild_id: int, user_id: int):
+        options = [
+            discord.SelectOption(label=service["label"], value=key, emoji=service["emoji"])
+            for key, service in LINK_SERVICES.items()
+        ]
+        super().__init__(placeholder="Choisis le service", options=options)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+    async def callback(self, interaction: discord.Interaction):
+        service_key = self.values[0]
+        await interaction.response.send_modal(LinkServiceModal(self.guild_id, self.user_id, service_key))
+
+
+class LinkServiceSelectView(discord.ui.View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=60)
+        self.add_item(LinkServiceSelect(guild_id, user_id))
 
 
 class LinkRemoveSelect(discord.ui.Select):
@@ -603,8 +656,8 @@ class ProfileEditSelect(discord.ui.Select):
                 description="Choisir la couleur de bordure de ton profil",
             ),
             discord.SelectOption(
-                label="Ajouter un lien", value="lien_ajouter", emoji="🔗",
-                description=f"Max {MAX_LINKS} liens (Twitter, portfolio...)",
+                label="Ajouter/modifier un lien", value="lien_ajouter", emoji="🔗",
+                description="Letterboxd ou AniList uniquement (max 2 liens)",
             ),
             discord.SelectOption(
                 label="Supprimer un lien", value="lien_supprimer", emoji="✂️",
@@ -637,7 +690,12 @@ class ProfileEditSelect(discord.ui.Select):
             await interaction.response.send_message("Choisis une couleur pour ton profil :", view=view, ephemeral=True)
 
         elif choice == "lien_ajouter":
-            await interaction.response.send_modal(LinkAddModal(self.guild_id, self.user_id))
+            view = LinkServiceSelectView(self.guild_id, self.user_id)
+            await interaction.response.send_message(
+                "Choisis le service (ton lien Letterboxd ou AniList sera créé ou remplacé) :",
+                view=view,
+                ephemeral=True,
+            )
 
         elif choice == "lien_supprimer":
             _, links = fetch_profile(self.guild_id, self.user_id)
