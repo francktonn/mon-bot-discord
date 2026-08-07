@@ -9,15 +9,14 @@ Permet à chaque membre d'un serveur de se créer une petite fiche de profil :
 - des liens Letterboxd et/ou AniList (max 2, un par service)
 - un compteur du nombre de messages envoyés sur le serveur
 - un temps total passé en vocal sur le serveur
-- un système de niveaux/XP basé sur l'activité (messages + vocal)
 
 Commandes slash (/) :
     /profil editor     -> ouvre un menu déroulant pour créer/modifier son profil
                            (bio, photo, couleur, liens, suppression) via des
                            sous-menus et des formulaires (modals), sans avoir
                            à mémoriser de commandes séparées.
-    /profil view [membre]      -> afficher le profil (le sien ou celui d'un autre membre)
-    /profil classement [critere] -> afficher le top 10 du serveur (XP, messages ou vocal)
+    /profil view [membre]        -> afficher le profil (le sien ou celui d'un autre membre)
+    /profil classement [critere] -> afficher le top 10 du serveur (messages ou vocal)
 
 Le compteur de messages s'incrémente automatiquement à chaque message envoyé
 par un membre sur le serveur (les messages des bots ne sont pas comptés).
@@ -25,11 +24,6 @@ par un membre sur le serveur (les messages des bots ne sont pas comptés).
 Le temps de vocal s'accumule automatiquement dès qu'un membre rejoint un salon
 vocal jusqu'à ce qu'il en reparte (les changements de salon vocal à vocal ne
 réinitialisent pas le chrono, seule une déconnexion complète l'arrête).
-
-L'XP est calculée automatiquement à partir des messages et du temps de vocal
-(pas de colonne séparée à maintenir) ; un niveau est débloqué tous les paliers
-d'XP, visible sur `/profil view` et `/profil classement` (aucune annonce
-publique n'est envoyée lors d'un passage de niveau).
 
 Les données sont stockées dans une base PostgreSQL externe (Neon, Supabase, ou
 tout autre Postgres compatible), configurée via la variable d'environnement
@@ -43,7 +37,6 @@ import os
 import re
 import time
 import asyncio
-import math
 from contextlib import contextmanager
 
 import discord
@@ -79,11 +72,6 @@ LINK_SERVICES = {
         "url_template": "https://anilist.co/user/{username}/",
     },
 }
-
-# Système de niveaux / XP : l'XP est dérivée des statistiques déjà suivies,
-# pas besoin de colonne supplémentaire pour la stocker.
-XP_PER_MESSAGE = 10
-XP_PER_VOICE_MINUTE = 5
 
 
 def resolve_link_url(service_key: str, raw_input: str) -> tuple[str | None, str | None]:
@@ -250,41 +238,6 @@ def format_duration(total_seconds: int) -> str:
     return f"{seconds}s"
 
 
-# ---------------------------------------------------------------------------
-# Système de niveaux / XP
-# ---------------------------------------------------------------------------
-
-def compute_xp(message_count: int, voice_seconds: int) -> int:
-    return message_count * XP_PER_MESSAGE + (voice_seconds // 60) * XP_PER_VOICE_MINUTE
-
-
-def xp_threshold(level: int) -> int:
-    """XP totale nécessaire pour atteindre ce niveau (paliers croissants)."""
-    return 50 * level * (level + 1)
-
-
-def compute_level(xp: int) -> int:
-    if xp <= 0:
-        return 0
-    # Résolution approchée de la formule quadratique, puis ajustement exact
-    # pour compenser les éventuelles imprécisions de virgule flottante.
-    level = int((-1 + math.sqrt(1 + (4 * xp) / 50)) / 2)
-    level = max(level, 0)
-    while xp_threshold(level + 1) <= xp:
-        level += 1
-    while level > 0 and xp_threshold(level) > xp:
-        level -= 1
-    return level
-
-
-def level_progress(xp: int) -> tuple[int, int, int]:
-    """Renvoie (niveau, xp_dans_le_niveau, xp_necessaire_pour_le_niveau)."""
-    level = compute_level(xp)
-    floor_xp = xp_threshold(level)
-    next_xp = xp_threshold(level + 1)
-    return level, xp - floor_xp, next_xp - floor_xp
-
-
 def add_link(guild_id: int, user_id: int, label: str, url: str) -> tuple[bool, str]:
     get_or_create_profile(guild_id, user_id)
     with get_db() as db, db.cursor() as cur:
@@ -374,9 +327,6 @@ def build_profile_embed(member: discord.Member, row, links) -> discord.Embed:
     message_count = message_count or 0
     voice_seconds = voice_seconds or 0
 
-    xp = compute_xp(message_count, voice_seconds)
-    level, xp_into_level, xp_needed = level_progress(xp)
-
     embed = discord.Embed(
         title=f"Profil de {member.display_name}",
         description=bio if bio else "*Aucune bio définie.*",
@@ -386,11 +336,6 @@ def build_profile_embed(member: discord.Member, row, links) -> discord.Embed:
     # Photo de profil personnalisée si définie, sinon avatar Discord
     embed.set_thumbnail(url=avatar_url or member.display_avatar.url)
 
-    embed.add_field(
-        name="🏆 Niveau",
-        value=f"**Niveau {level}**\n{xp_into_level}/{xp_needed} XP",
-        inline=True,
-    )
     embed.add_field(name="💬 Messages envoyés", value=str(message_count), inline=True)
     embed.add_field(name="🎙️ Temps en vocal", value=format_duration(voice_seconds), inline=True)
 
@@ -760,10 +705,9 @@ async def profil_view(interaction: discord.Interaction, membre: discord.Member =
 # ---- /profil classement -------------------------------------------------------
 
 @profil_group.command(name="classement", description="Affiche le top 10 du serveur")
-@app_commands.describe(critere="Le critère de classement (par défaut : niveau/XP)")
+@app_commands.describe(critere="Le critère de classement (par défaut : messages)")
 @app_commands.choices(
     critere=[
-        app_commands.Choice(name="Niveau / XP", value="xp"),
         app_commands.Choice(name="Messages envoyés", value="messages"),
         app_commands.Choice(name="Temps en vocal", value="vocal"),
     ]
@@ -771,7 +715,7 @@ async def profil_view(interaction: discord.Interaction, membre: discord.Member =
 async def profil_classement(
     interaction: discord.Interaction, critere: app_commands.Choice[str] = None
 ):
-    key = critere.value if critere else "xp"
+    key = critere.value if critere else "messages"
     rows = fetch_all_profiles(interaction.guild_id)
 
     if not rows:
@@ -784,32 +728,27 @@ async def profil_classement(
     for user_id, message_count, voice_seconds in rows:
         message_count = message_count or 0
         voice_seconds = voice_seconds or 0
-        xp = compute_xp(message_count, voice_seconds)
-        level = compute_level(xp)
-        enriched.append((user_id, message_count, voice_seconds, xp, level))
+        enriched.append((user_id, message_count, voice_seconds))
 
-    sort_key = {"messages": 1, "vocal": 2, "xp": 3}[key]
+    sort_key = {"messages": 1, "vocal": 2}[key]
     enriched.sort(key=lambda r: r[sort_key], reverse=True)
     top = enriched[:10]
 
     medals = ["🥇", "🥈", "🥉"]
     lines = []
-    for i, (user_id, message_count, voice_seconds, xp, level) in enumerate(top):
+    for i, (user_id, message_count, voice_seconds) in enumerate(top):
         member = interaction.guild.get_member(user_id)
         name = member.display_name if member else f"Utilisateur inconnu ({user_id})"
         rank_icon = medals[i] if i < len(medals) else f"`#{i + 1}`"
 
         if key == "messages":
             value = f"{message_count} messages"
-        elif key == "vocal":
-            value = format_duration(voice_seconds)
         else:
-            value = f"Niveau {level} — {xp} XP"
+            value = format_duration(voice_seconds)
 
         lines.append(f"{rank_icon} **{name}** — {value}")
 
     titles = {
-        "xp": "🏆 Classement du serveur — Niveau / XP",
         "messages": "💬 Classement du serveur — Messages",
         "vocal": "🎙️ Classement du serveur — Temps en vocal",
     }
