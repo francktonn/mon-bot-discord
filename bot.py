@@ -38,11 +38,13 @@ import re
 import time
 import asyncio
 from contextlib import contextmanager
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
 
 import discord
 import psycopg2
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from aiohttp import web
 
@@ -56,6 +58,17 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 MAX_LINKS = 2
 MAX_BIO_LEN = 500
 EMBED_COLOR = 0x5865F2  # blurple (couleur par défaut si aucune n'est choisie)
+
+MONTHS_FR = [
+    "janvier", "février", "mars", "avril", "mai", "juin",
+    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+]
+
+# Heure française (gère automatiquement CET/CEST) à laquelle les anniversaires
+# du jour sont annoncés.
+PARIS_TZ = ZoneInfo("Europe/Paris")
+BIRTHDAY_ANNOUNCE_TIME = dt_time(hour=9, minute=0, tzinfo=PARIS_TZ)
+
 
 # Seuls ces deux services sont acceptés comme liens de profil (un lien par service).
 LINK_SERVICES = {
@@ -132,6 +145,8 @@ def init_db():
                 message_count INTEGER NOT NULL DEFAULT 0,
                 voice_seconds INTEGER NOT NULL DEFAULT 0,
                 profile_color INTEGER,
+                birthday_day INTEGER,
+                birthday_month INTEGER,
                 PRIMARY KEY (guild_id, user_id)
             )
             """
@@ -153,6 +168,8 @@ def init_db():
         cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS message_count INTEGER NOT NULL DEFAULT 0")
         cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS voice_seconds INTEGER NOT NULL DEFAULT 0")
         cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS profile_color INTEGER")
+        cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS birthday_day INTEGER")
+        cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS birthday_month INTEGER")
 
 
 def get_or_create_profile(guild_id: int, user_id: int):
@@ -181,10 +198,41 @@ def update_field(guild_id: int, user_id: int, field: str, value):
         )
 
 
+def set_birthday(guild_id: int, user_id: int, day: int, month: int):
+    get_or_create_profile(guild_id, user_id)
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "UPDATE profiles SET birthday_day = %s, birthday_month = %s WHERE guild_id = %s AND user_id = %s",
+            (day, month, guild_id, user_id),
+        )
+
+
+def clear_birthday(guild_id: int, user_id: int):
+    get_or_create_profile(guild_id, user_id)
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "UPDATE profiles SET birthday_day = NULL, birthday_month = NULL "
+            "WHERE guild_id = %s AND user_id = %s",
+            (guild_id, user_id),
+        )
+
+
+def get_birthdays_for_date(day: int, month: int) -> list[tuple[int, int]]:
+    """Renvoie (guild_id, user_id) de tous les membres, tous serveurs confondus,
+    dont l'anniversaire tombe sur cette date."""
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "SELECT guild_id, user_id FROM profiles WHERE birthday_day = %s AND birthday_month = %s",
+            (day, month),
+        )
+        return cur.fetchall()
+
+
 def fetch_profile(guild_id: int, user_id: int):
     with get_db() as db, db.cursor() as cur:
         cur.execute(
-            "SELECT bio, avatar_url, message_count, voice_seconds, profile_color "
+            "SELECT bio, avatar_url, message_count, voice_seconds, profile_color, "
+            "birthday_day, birthday_month "
             "FROM profiles WHERE guild_id = %s AND user_id = %s",
             (guild_id, user_id),
         )
@@ -323,7 +371,9 @@ async def start_fake_webserver():
 
 
 def build_profile_embed(member: discord.Member, row, links) -> discord.Embed:
-    bio, avatar_url, message_count, voice_seconds, profile_color = row if row else (None, None, 0, 0, None)
+    bio, avatar_url, message_count, voice_seconds, profile_color, birthday_day, birthday_month = (
+        row if row else (None, None, 0, 0, None, None, None)
+    )
     message_count = message_count or 0
     voice_seconds = voice_seconds or 0
 
@@ -339,12 +389,48 @@ def build_profile_embed(member: discord.Member, row, links) -> discord.Embed:
     embed.add_field(name="💬 Messages envoyés", value=str(message_count), inline=True)
     embed.add_field(name="🎙️ Temps en vocal", value=format_duration(voice_seconds), inline=True)
 
+    if birthday_day and birthday_month:
+        embed.add_field(
+            name="🎂 Anniversaire",
+            value=f"{birthday_day} {MONTHS_FR[birthday_month - 1]}",
+            inline=True,
+        )
+
     if links:
         liens_txt = "\n".join(f"🔗 [{label}]({url})" for label, url in links)
         embed.add_field(name="Liens utiles", value=liens_txt, inline=False)
 
     embed.set_footer(text=f"Membre depuis le serveur • {member.guild.name}")
     return embed
+
+
+@tasks.loop(time=BIRTHDAY_ANNOUNCE_TIME)
+async def birthday_announcement_task():
+    """S'exécute chaque jour à l'heure définie (heure française, CET/CEST gérée
+    automatiquement par ZoneInfo) et annonce les anniversaires du jour."""
+    today = datetime.now(PARIS_TZ)
+    matches = get_birthdays_for_date(today.day, today.month)
+
+    for guild_id, user_id in matches:
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            continue
+        member = guild.get_member(user_id)
+        if member is None or member.bot:
+            continue
+        channel = guild.system_channel
+        if channel is None:
+            continue
+        try:
+            await channel.send(f"🎂 Joyeux anniversaire {member.mention} ! 🎉")
+        except discord.Forbidden:
+            pass
+
+
+@birthday_announcement_task.before_loop
+async def before_birthday_announcement_task():
+    # Évite que la tâche se déclenche avant que le bot ne soit pleinement connecté.
+    await bot.wait_until_ready()
 
 
 @bot.event
@@ -362,6 +448,11 @@ async def on_ready():
     if not _webserver_started and os.getenv("PORT"):
         _webserver_started = True
         asyncio.create_task(start_fake_webserver())
+
+    # tasks.loop lève une erreur si on tente de la démarrer alors qu'elle
+    # tourne déjà (ex: on_ready se redéclenche après une reconnexion Discord).
+    if not birthday_announcement_task.is_running():
+        birthday_announcement_task.start()
 
     # Si le bot redémarre pendant que des membres sont déjà en vocal,
     # on démarre leur chrono maintenant pour ne pas perdre le suivi.
@@ -428,6 +519,57 @@ class BioModal(discord.ui.Modal, title="Modifier ma bio"):
     async def on_submit(self, interaction: discord.Interaction):
         update_field(self.guild_id, self.user_id, "bio", str(self.bio_input.value))
         await interaction.response.send_message("Ta bio a été mise à jour ✅", ephemeral=True)
+
+
+def is_valid_day_month(day: int, month: int) -> bool:
+    if not (1 <= month <= 12):
+        return False
+    # 29 accepté pour février (année bissextile) même si on ne stocke pas l'année.
+    days_in_month = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    return 1 <= day <= days_in_month[month - 1]
+
+
+class BirthdayModal(discord.ui.Modal, title="Mon anniversaire"):
+    date_input = discord.ui.TextInput(
+        label="Date (JJ/MM)",
+        placeholder="ex: 25/12",
+        max_length=5,
+        required=False,
+    )
+
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.user_id = user_id
+        row, _ = fetch_profile(guild_id, user_id)
+        if row and row[5] and row[6]:
+            self.date_input.default = f"{row[5]:02d}/{row[6]:02d}"
+        self.date_input.placeholder = "ex: 25/12 (laisse vide pour retirer)"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.date_input.value).strip()
+
+        if not raw:
+            clear_birthday(self.guild_id, self.user_id)
+            await interaction.response.send_message("Anniversaire retiré de ton profil.", ephemeral=True)
+            return
+
+        match = re.fullmatch(r"(\d{1,2})\s*/\s*(\d{1,2})", raw)
+        if not match:
+            await interaction.response.send_message(
+                "Format invalide. Utilise JJ/MM, par exemple 25/12.", ephemeral=True
+            )
+            return
+
+        day, month = int(match.group(1)), int(match.group(2))
+        if not is_valid_day_month(day, month):
+            await interaction.response.send_message("Cette date n'existe pas.", ephemeral=True)
+            return
+
+        set_birthday(self.guild_id, self.user_id, day, month)
+        await interaction.response.send_message(
+            f"🎂 Anniversaire enregistré : **{day} {MONTHS_FR[month - 1]}**", ephemeral=True
+        )
 
 
 class LinkServiceModal(discord.ui.Modal):
@@ -601,6 +743,10 @@ class ProfileEditSelect(discord.ui.Select):
                 description="Choisir la couleur de bordure de ton profil",
             ),
             discord.SelectOption(
+                label="Définir mon anniversaire", value="anniversaire", emoji="🎂",
+                description="Le bot annoncera le jour J (heure française)",
+            ),
+            discord.SelectOption(
                 label="Ajouter/modifier un lien", value="lien_ajouter", emoji="🔗",
                 description="Letterboxd ou AniList uniquement (max 2 liens)",
             ),
@@ -634,6 +780,9 @@ class ProfileEditSelect(discord.ui.Select):
             view = ColorSelectView(self.guild_id, self.user_id)
             await interaction.response.send_message("Choisis une couleur pour ton profil :", view=view, ephemeral=True)
 
+        elif choice == "anniversaire":
+            await interaction.response.send_modal(BirthdayModal(self.guild_id, self.user_id))
+
         elif choice == "lien_ajouter":
             view = LinkServiceSelectView(self.guild_id, self.user_id)
             await interaction.response.send_message(
@@ -653,8 +802,8 @@ class ProfileEditSelect(discord.ui.Select):
         elif choice == "supprimer":
             view = ConfirmDeleteView(self.guild_id, self.user_id)
             await interaction.response.send_message(
-                "⚠️ Es-tu sûr de vouloir supprimer tout ton profil (bio, photo, couleur, liens, statistiques) ? "
-                "Cette action est irréversible.",
+                "⚠️ Es-tu sûr de vouloir supprimer tout ton profil (bio, photo, couleur, anniversaire, liens, "
+                "statistiques) ? Cette action est irréversible.",
                 view=view,
                 ephemeral=True,
             )
