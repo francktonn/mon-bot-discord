@@ -16,7 +16,6 @@ Commandes slash (/) :
                            sous-menus et des formulaires (modals), sans avoir
                            à mémoriser de commandes séparées.
     /profil view [membre]        -> afficher le profil (le sien ou celui d'un autre membre)
-    /profil classement [critere] -> afficher le top 10 du serveur (messages ou vocal)
 
 Le compteur de messages s'incrémente automatiquement à chaque message envoyé
 par un membre sur le serveur (les messages des bots ne sont pas comptés).
@@ -396,16 +395,6 @@ def fetch_profile(guild_id: int, user_id: int):
         )
         links = cur.fetchall()
     return row, links
-
-
-def fetch_all_profiles(guild_id: int) -> list[tuple[int, int, int]]:
-    """Renvoie (user_id, message_count, voice_seconds) pour tous les profils d'un serveur."""
-    with get_db() as db, db.cursor() as cur:
-        cur.execute(
-            "SELECT user_id, message_count, voice_seconds FROM profiles WHERE guild_id = %s",
-            (guild_id,),
-        )
-        return cur.fetchall()
 
 
 def increment_message_count(guild_id: int, user_id: int):
@@ -1429,60 +1418,6 @@ async def profil_view(interaction: discord.Interaction, membre: discord.Member =
         return
 
     embed = build_profile_embed(target, row, links)
-    await interaction.response.send_message(embed=embed)
-
-
-# ---- /profil classement -------------------------------------------------------
-
-@profil_group.command(name="classement", description="Affiche le top 10 du serveur")
-@app_commands.describe(critere="Le critère de classement (par défaut : messages)")
-@app_commands.choices(
-    critere=[
-        app_commands.Choice(name="Messages envoyés", value="messages"),
-        app_commands.Choice(name="Temps en vocal", value="vocal"),
-    ]
-)
-async def profil_classement(
-    interaction: discord.Interaction, critere: app_commands.Choice[str] = None
-):
-    key = critere.value if critere else "messages"
-    rows = fetch_all_profiles(interaction.guild_id)
-
-    if not rows:
-        await interaction.response.send_message(
-            "Aucun profil n'a encore été créé sur ce serveur.", ephemeral=True
-        )
-        return
-
-    enriched = []
-    for user_id, message_count, voice_seconds in rows:
-        message_count = message_count or 0
-        voice_seconds = voice_seconds or 0
-        enriched.append((user_id, message_count, voice_seconds))
-
-    sort_key = {"messages": 1, "vocal": 2}[key]
-    enriched.sort(key=lambda r: r[sort_key], reverse=True)
-    top = enriched[:10]
-
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for i, (user_id, message_count, voice_seconds) in enumerate(top):
-        member = interaction.guild.get_member(user_id)
-        name = member.display_name if member else f"Utilisateur inconnu ({user_id})"
-        rank_icon = medals[i] if i < len(medals) else f"`#{i + 1}`"
-
-        if key == "messages":
-            value = f"{message_count} messages"
-        else:
-            value = format_duration(voice_seconds)
-
-        lines.append(f"{rank_icon} **{name}** — {value}")
-
-    titles = {
-        "messages": "💬 Classement du serveur — Messages",
-        "vocal": "🎙️ Classement du serveur — Temps en vocal",
-    }
-    embed = discord.Embed(title=titles[key], description="\n".join(lines), color=EMBED_COLOR)
     await interaction.response.send_message(embed=embed)
 
 
