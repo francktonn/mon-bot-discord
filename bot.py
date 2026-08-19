@@ -70,8 +70,12 @@ MONTHS_FR = [
 PARIS_TZ = ZoneInfo("Europe/Paris")
 BIRTHDAY_ANNOUNCE_TIME = dt_time(hour=9, minute=0, tzinfo=PARIS_TZ)
 
-# Système d'événements : nom de la catégorie où sont rangés les salons temporaires,
+# Système d'événements : catégorie où sont rangés les salons temporaires,
 # et délai après lequel un événement non clôturé manuellement est nettoyé automatiquement.
+# ID de la catégorie Discord à utiliser en priorité (si elle existe bien sur le
+# serveur où la commande est utilisée) ; sinon, le bot retombe sur une recherche/
+# création par nom (utile si le bot tourne sur plusieurs serveurs différents).
+EVENT_CATEGORY_ID = 1539441756939100260
 EVENT_CATEGORY_NAME = "🗓️ Événements"
 EVENT_AUTO_CLEANUP_HOURS = 6
 
@@ -720,9 +724,13 @@ def build_event_embed(
 async def create_event_channels(
     guild: discord.Guild, event_name: str, organizer: discord.Member
 ) -> tuple[discord.TextChannel, discord.VoiceChannel]:
-    category = discord.utils.get(guild.categories, name=EVENT_CATEGORY_NAME)
-    if category is None:
-        category = await guild.create_category(EVENT_CATEGORY_NAME)
+    # On utilise la catégorie fixe configurée (EVENT_CATEGORY_ID) si elle existe
+    # bien sur ce serveur ; sinon on retombe sur une recherche/création par nom.
+    category = guild.get_channel(EVENT_CATEGORY_ID)
+    if not isinstance(category, discord.CategoryChannel):
+        category = discord.utils.get(guild.categories, name=EVENT_CATEGORY_NAME)
+        if category is None:
+            category = await guild.create_category(EVENT_CATEGORY_NAME)
 
     safe_name = sanitize_channel_name(event_name)
 
