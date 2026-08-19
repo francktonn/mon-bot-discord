@@ -37,12 +37,14 @@ import os
 import re
 import time
 import asyncio
+import unicodedata
 from contextlib import contextmanager
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import discord
 import psycopg2
+import psycopg2.extras
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -68,6 +70,12 @@ MONTHS_FR = [
 # du jour sont annoncés.
 PARIS_TZ = ZoneInfo("Europe/Paris")
 BIRTHDAY_ANNOUNCE_TIME = dt_time(hour=9, minute=0, tzinfo=PARIS_TZ)
+
+# Système d'événements : nom de la catégorie où sont rangés les salons temporaires,
+# et délai après lequel un événement non clôturé manuellement est nettoyé automatiquement.
+EVENT_CATEGORY_NAME = "🗓️ Événements"
+EVENT_AUTO_CLEANUP_HOURS = 6
+
 
 
 # Seuls ces deux services sont acceptés comme liens de profil (un lien par service).
@@ -171,6 +179,36 @@ def init_db():
         cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS birthday_day INTEGER")
         cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS birthday_month INTEGER")
 
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id SERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                organizer_id BIGINT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                event_datetime TIMESTAMPTZ NOT NULL,
+                max_participants INTEGER,
+                text_channel_id BIGINT,
+                voice_channel_id BIGINT,
+                announcement_channel_id BIGINT,
+                announcement_message_id BIGINT,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_participants (
+                event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (event_id, user_id)
+            )
+            """
+        )
+
 
 def get_or_create_profile(guild_id: int, user_id: int):
     with get_db() as db, db.cursor() as cur:
@@ -226,6 +264,121 @@ def get_birthdays_for_date(day: int, month: int) -> list[tuple[int, int]]:
             (day, month),
         )
         return cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Base de données : système d'événements
+# ---------------------------------------------------------------------------
+
+def create_event(
+    guild_id: int,
+    organizer_id: int,
+    name: str,
+    description: str | None,
+    event_datetime_utc: datetime,
+    max_participants: int | None,
+) -> int:
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO events (guild_id, organizer_id, name, description, event_datetime, max_participants)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (guild_id, organizer_id, name, description, event_datetime_utc, max_participants),
+        )
+        event_id = cur.fetchone()[0]
+    return event_id
+
+
+def set_event_channels(event_id: int, text_channel_id: int, voice_channel_id: int):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "UPDATE events SET text_channel_id = %s, voice_channel_id = %s WHERE id = %s",
+            (text_channel_id, voice_channel_id, event_id),
+        )
+
+
+def set_event_announcement(event_id: int, channel_id: int, message_id: int):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "UPDATE events SET announcement_channel_id = %s, announcement_message_id = %s WHERE id = %s",
+            (channel_id, message_id, event_id),
+        )
+
+
+def get_event(event_id: int) -> dict | None:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM events WHERE id = %s", (event_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_open_events(guild_id: int) -> list[dict]:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM events WHERE guild_id = %s AND status = 'open' ORDER BY event_datetime ASC",
+            (guild_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_all_open_events() -> list[dict]:
+    """Tous les événements ouverts, tous serveurs confondus (pour réenregistrer
+    les boutons persistants au démarrage et pour la tâche de nettoyage auto)."""
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM events WHERE status = 'open'")
+        return [dict(r) for r in cur.fetchall()]
+
+
+def add_participant(event_id: int, user_id: int) -> tuple[bool, str]:
+    with get_db() as db, db.cursor() as cur:
+        cur.execute("SELECT status, max_participants FROM events WHERE id = %s", (event_id,))
+        event_row = cur.fetchone()
+        if event_row is None:
+            return False, "Cet événement n'existe plus."
+        status, max_participants = event_row
+        if status != "open":
+            return False, "Cet événement est fermé."
+
+        cur.execute(
+            "SELECT 1 FROM event_participants WHERE event_id = %s AND user_id = %s",
+            (event_id, user_id),
+        )
+        if cur.fetchone() is not None:
+            return False, "Tu participes déjà à cet événement."
+
+        if max_participants is not None:
+            cur.execute("SELECT COUNT(*) FROM event_participants WHERE event_id = %s", (event_id,))
+            count = cur.fetchone()[0]
+            if count >= max_participants:
+                return False, "Cet événement est complet."
+
+        cur.execute(
+            "INSERT INTO event_participants (event_id, user_id) VALUES (%s, %s)",
+            (event_id, user_id),
+        )
+    return True, "ok"
+
+
+def remove_participant(event_id: int, user_id: int) -> bool:
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM event_participants WHERE event_id = %s AND user_id = %s",
+            (event_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_participant_count(event_id: int) -> int:
+    with get_db() as db, db.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM event_participants WHERE event_id = %s", (event_id,))
+        return cur.fetchone()[0]
+
+
+def close_event(event_id: int, new_status: str = "completed"):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute("UPDATE events SET status = %s WHERE id = %s", (new_status, event_id))
 
 
 def fetch_profile(guild_id: int, user_id: int):
@@ -345,6 +498,10 @@ voice_sessions: dict[tuple[int, int], float] = {}
 # plusieurs fois (reconnexions Discord).
 _webserver_started = False
 
+# Empêche de réenregistrer plusieurs fois les vues persistantes des événements
+# si on_ready se déclenche plusieurs fois (reconnexions Discord).
+_event_views_registered = False
+
 
 async def _health_handler(request: web.Request) -> web.Response:
     return web.Response(text="Le bot Discord de profil est en ligne.")
@@ -453,6 +610,17 @@ async def on_ready():
     # tourne déjà (ex: on_ready se redéclenche après une reconnexion Discord).
     if not birthday_announcement_task.is_running():
         birthday_announcement_task.start()
+    if not event_cleanup_task.is_running():
+        event_cleanup_task.start()
+
+    # Réenregistre les boutons "Participer"/"Se désister" de tous les événements
+    # encore ouverts, pour qu'ils continuent de fonctionner après un redémarrage
+    # ou un redéploiement du bot (les vues persistantes ne survivent pas d'elles-mêmes).
+    global _event_views_registered
+    if not _event_views_registered:
+        _event_views_registered = True
+        for event in get_all_open_events():
+            bot.add_view(EventView(event["id"]))
 
     # Si le bot redémarre pendant que des membres sont déjà en vocal,
     # on démarre leur chrono maintenant pour ne pas perdre le suivi.
@@ -492,6 +660,419 @@ async def on_voice_state_update(
             elapsed = int(time.monotonic() - start)
             add_voice_seconds(member.guild.id, member.id, elapsed)
     # Un simple changement de salon vocal à vocal ne coupe pas le chrono.
+
+
+# ---------------------------------------------------------------------------
+# Système d'événements : aides, salons temporaires et boutons persistants
+# ---------------------------------------------------------------------------
+
+def sanitize_channel_name(name: str) -> str:
+    """Convertit un nom d'événement en nom de salon Discord valide."""
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    name = name.lower().strip()
+    name = re.sub(r"\s+", "-", name)
+    name = re.sub(r"[^a-z0-9\-_]", "", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    return name[:90] or "evenement"
+
+
+def parse_event_datetime(date_str: str, heure_str: str) -> datetime | None:
+    """Parse une date JJ/MM/AAAA et une heure HH:MM (heure française) en datetime
+    "aware" dans le fuseau Europe/Paris. Renvoie None si le format ou la date
+    (ex: 31/02) est invalide."""
+    date_str = date_str.strip()
+    heure_str = heure_str.strip()
+
+    m_date = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", date_str)
+    m_heure = re.fullmatch(r"(\d{1,2}):(\d{2})", heure_str)
+    if not m_date or not m_heure:
+        return None
+
+    day, month, year = int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3))
+    hour, minute = int(m_heure.group(1)), int(m_heure.group(2))
+
+    if not is_valid_day_month(day, month):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    try:
+        return datetime(year, month, day, hour, minute, tzinfo=PARIS_TZ)
+    except ValueError:
+        # Cas comme le 29/02 sur une année non bissextile : la date n'existe pas.
+        return None
+
+
+def build_event_embed(
+    name: str,
+    description: str | None,
+    event_dt_paris: datetime,
+    max_participants: int | None,
+    participant_count: int,
+    organizer_id: int,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"📅 {name}",
+        description=description or "*Aucune description.*",
+        color=EMBED_COLOR,
+    )
+    embed.add_field(
+        name="🗓️ Date",
+        value=event_dt_paris.strftime("%d/%m/%Y à %H:%M") + " (heure française)",
+        inline=False,
+    )
+    limite = f"{participant_count}/{max_participants}" if max_participants else f"{participant_count} (illimité)"
+    embed.add_field(name="👥 Participants", value=limite, inline=True)
+    embed.add_field(name="🎤 Organisateur", value=f"<@{organizer_id}>", inline=True)
+    embed.set_footer(text="Clique sur Participer pour rejoindre les salons de l'événement")
+    return embed
+
+
+async def create_event_channels(
+    guild: discord.Guild, event_name: str, organizer: discord.Member
+) -> tuple[discord.TextChannel, discord.VoiceChannel]:
+    category = discord.utils.get(guild.categories, name=EVENT_CATEGORY_NAME)
+    if category is None:
+        category = await guild.create_category(EVENT_CATEGORY_NAME)
+
+    safe_name = sanitize_channel_name(event_name)
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True, connect=True),
+        organizer: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True, speak=True),
+    }
+
+    text_channel = await guild.create_text_channel(
+        f"💬-{safe_name}", category=category, overwrites=overwrites,
+        reason=f"Événement créé par {organizer}",
+    )
+    voice_channel = await guild.create_voice_channel(
+        f"🔊 {event_name}"[:100], category=category, overwrites=overwrites,
+        reason=f"Événement créé par {organizer}",
+    )
+    return text_channel, voice_channel
+
+
+async def cleanup_event_channels(guild: discord.Guild, event: dict):
+    for channel_id in (event.get("text_channel_id"), event.get("voice_channel_id")):
+        if not channel_id:
+            continue
+        channel = guild.get_channel(channel_id)
+        if channel is not None:
+            try:
+                await channel.delete(reason="Événement terminé")
+            except (discord.Forbidden, discord.NotFound):
+                pass
+
+
+async def refresh_event_announcement(bot_client: discord.Client, event_id: int):
+    """Met à jour le compteur de participants sur le message d'annonce d'un événement."""
+    event = get_event(event_id)
+    if not event or not event["announcement_channel_id"] or not event["announcement_message_id"]:
+        return
+    channel = bot_client.get_channel(event["announcement_channel_id"])
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(event["announcement_message_id"])
+    except (discord.NotFound, discord.Forbidden):
+        return
+
+    count = get_participant_count(event_id)
+    event_dt_paris = event["event_datetime"].astimezone(PARIS_TZ)
+    embed = build_event_embed(
+        event["name"], event["description"], event_dt_paris,
+        event["max_participants"], count, event["organizer_id"],
+    )
+    try:
+        await message.edit(embed=embed)
+    except discord.Forbidden:
+        pass
+
+
+async def finalize_event_announcement(bot_client: discord.Client, event_id: int, note: str):
+    """Fige l'annonce d'un événement clôturé : couleur neutre, boutons retirés."""
+    event = get_event(event_id)
+    if not event or not event["announcement_channel_id"] or not event["announcement_message_id"]:
+        return
+    channel = bot_client.get_channel(event["announcement_channel_id"])
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(event["announcement_message_id"])
+    except (discord.NotFound, discord.Forbidden):
+        return
+
+    count = get_participant_count(event_id)
+    event_dt_paris = event["event_datetime"].astimezone(PARIS_TZ)
+    embed = build_event_embed(
+        event["name"], event["description"], event_dt_paris,
+        event["max_participants"], count, event["organizer_id"],
+    )
+    embed.color = 0x2C2F33
+    embed.set_footer(text=note)
+    try:
+        await message.edit(embed=embed, view=None)
+    except discord.Forbidden:
+        pass
+
+
+async def handle_event_join(interaction: discord.Interaction, event_id: int):
+    event = get_event(event_id)
+    if event is None:
+        await interaction.response.send_message("Cet événement n'existe plus.", ephemeral=True)
+        return
+
+    ok, msg = add_participant(event_id, interaction.user.id)
+    if not ok:
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    guild = interaction.guild
+    text_channel = guild.get_channel(event["text_channel_id"]) if event["text_channel_id"] else None
+    voice_channel = guild.get_channel(event["voice_channel_id"]) if event["voice_channel_id"] else None
+
+    try:
+        if text_channel:
+            await text_channel.set_permissions(interaction.user, view_channel=True, send_messages=True)
+        if voice_channel:
+            await voice_channel.set_permissions(interaction.user, view_channel=True, connect=True, speak=True)
+    except discord.Forbidden:
+        pass
+
+    lien = f" Rendez-vous sur {text_channel.mention}." if text_channel else ""
+    await interaction.response.send_message(
+        f"Tu participes maintenant à **{event['name']}** !{lien}", ephemeral=True
+    )
+    await refresh_event_announcement(interaction.client, event_id)
+
+
+async def handle_event_leave(interaction: discord.Interaction, event_id: int):
+    event = get_event(event_id)
+    if event is None:
+        await interaction.response.send_message("Cet événement n'existe plus.", ephemeral=True)
+        return
+
+    removed = remove_participant(event_id, interaction.user.id)
+    if not removed:
+        await interaction.response.send_message("Tu ne participais pas à cet événement.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    text_channel = guild.get_channel(event["text_channel_id"]) if event["text_channel_id"] else None
+    voice_channel = guild.get_channel(event["voice_channel_id"]) if event["voice_channel_id"] else None
+
+    try:
+        if text_channel:
+            await text_channel.set_permissions(interaction.user, overwrite=None)
+        if voice_channel:
+            await voice_channel.set_permissions(interaction.user, overwrite=None)
+            # Si la personne est déjà connectée au salon vocal de l'événement, on la déconnecte
+            # (le retrait de la permission n'éjecte pas automatiquement quelqu'un déjà connecté).
+            member = guild.get_member(interaction.user.id)
+            if member and member.voice and member.voice.channel and member.voice.channel.id == voice_channel.id:
+                await member.move_to(None)
+    except discord.Forbidden:
+        pass
+
+    await interaction.response.send_message(f"Tu ne participes plus à **{event['name']}**.", ephemeral=True)
+    await refresh_event_announcement(interaction.client, event_id)
+
+
+class EventView(discord.ui.View):
+    """Vue persistante (timeout=None) attachée à un événement précis, via des
+    custom_id encodant l'event_id. Réenregistrée à chaque démarrage du bot pour
+    que les boutons restent fonctionnels après un redéploiement."""
+
+    def __init__(self, event_id: int):
+        super().__init__(timeout=None)
+        self.event_id = event_id
+
+        join_button = discord.ui.Button(
+            label="Participer", emoji="✅", style=discord.ButtonStyle.success,
+            custom_id=f"event_join:{event_id}",
+        )
+        join_button.callback = self.join_callback
+        self.add_item(join_button)
+
+        leave_button = discord.ui.Button(
+            label="Se désister", emoji="❌", style=discord.ButtonStyle.secondary,
+            custom_id=f"event_leave:{event_id}",
+        )
+        leave_button.callback = self.leave_callback
+        self.add_item(leave_button)
+
+    async def join_callback(self, interaction: discord.Interaction):
+        await handle_event_join(interaction, self.event_id)
+
+    async def leave_callback(self, interaction: discord.Interaction):
+        await handle_event_leave(interaction, self.event_id)
+
+
+event_group = app_commands.Group(name="event", description="Créer et gérer des événements avec salons temporaires")
+
+
+async def event_autocomplete(interaction: discord.Interaction, current: str):
+    if interaction.guild_id is None:
+        return []
+    events = get_open_events(interaction.guild_id)
+    choices = []
+    for e in events:
+        dt_paris = e["event_datetime"].astimezone(PARIS_TZ)
+        label = f"{e['name']} — {dt_paris.strftime('%d/%m %H:%M')}"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=e["id"]))
+    return choices[:25]
+
+
+@event_group.command(name="create", description="Créer un événement avec ses salons temporaires")
+@app_commands.describe(
+    nom="Nom de l'événement",
+    date="Date au format JJ/MM/AAAA",
+    heure="Heure au format HH:MM (heure française)",
+    description="Description de l'événement (optionnel)",
+    max_participants="Nombre maximum de participants (optionnel, illimité si vide)",
+)
+async def event_create(
+    interaction: discord.Interaction,
+    nom: str,
+    date: str,
+    heure: str,
+    description: str = None,
+    max_participants: int = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+
+    if len(nom) > 80:
+        await interaction.response.send_message("Le nom de l'événement est trop long (max 80 caractères).", ephemeral=True)
+        return
+
+    event_dt = parse_event_datetime(date, heure)
+    if event_dt is None:
+        await interaction.response.send_message(
+            "Date ou heure invalide. Utilise le format JJ/MM/AAAA pour la date et HH:MM pour l'heure.",
+            ephemeral=True,
+        )
+        return
+
+    if event_dt <= datetime.now(PARIS_TZ):
+        await interaction.response.send_message("La date de l'événement doit être dans le futur.", ephemeral=True)
+        return
+
+    if max_participants is not None and max_participants < 1:
+        await interaction.response.send_message(
+            "Le nombre maximum de participants doit être un nombre positif.", ephemeral=True
+        )
+        return
+
+    # La création des salons peut prendre un court instant.
+    await interaction.response.defer(thinking=True)
+
+    try:
+        text_channel, voice_channel = await create_event_channels(interaction.guild, nom, interaction.user)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Je n'ai pas la permission de créer des salons sur ce serveur. "
+            "Vérifie que j'ai la permission \"Gérer les salons\"."
+        )
+        return
+
+    event_id = create_event(
+        interaction.guild_id,
+        interaction.user.id,
+        nom,
+        description,
+        event_dt.astimezone(timezone.utc),
+        max_participants,
+    )
+    set_event_channels(event_id, text_channel.id, voice_channel.id)
+
+    # L'organisateur participe automatiquement à son propre événement.
+    add_participant(event_id, interaction.user.id)
+
+    embed = build_event_embed(nom, description, event_dt, max_participants, 1, interaction.user.id)
+    view = EventView(event_id)
+    message = await interaction.followup.send(embed=embed, view=view, wait=True)
+
+    set_event_announcement(event_id, message.channel.id, message.id)
+
+
+@event_group.command(name="list", description="Liste les événements à venir sur ce serveur")
+async def event_list(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+
+    events = get_open_events(interaction.guild_id)
+    if not events:
+        await interaction.response.send_message("Aucun événement à venir sur ce serveur.", ephemeral=True)
+        return
+
+    lines = []
+    for e in events:
+        count = get_participant_count(e["id"])
+        limite = f"{count}/{e['max_participants']}" if e["max_participants"] else f"{count}"
+        dt_paris = e["event_datetime"].astimezone(PARIS_TZ)
+        lines.append(f"📅 **{e['name']}** — {dt_paris.strftime('%d/%m/%Y à %H:%M')} — {limite} participant(s)")
+
+    embed = discord.Embed(title="🗓️ Événements à venir", description="\n".join(lines), color=EMBED_COLOR)
+    await interaction.response.send_message(embed=embed)
+
+
+@event_group.command(name="close", description="Clôturer un événement et supprimer ses salons")
+@app_commands.describe(evenement="L'événement à clôturer")
+@app_commands.autocomplete(evenement=event_autocomplete)
+async def event_close(interaction: discord.Interaction, evenement: int):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+
+    event = get_event(evenement)
+    if event is None or event["guild_id"] != interaction.guild_id:
+        await interaction.response.send_message("Événement introuvable.", ephemeral=True)
+        return
+
+    is_organizer = interaction.user.id == event["organizer_id"]
+    is_admin = interaction.user.guild_permissions.manage_channels
+    if not (is_organizer or is_admin):
+        await interaction.response.send_message(
+            "Seul l'organisateur ou un membre avec la permission \"Gérer les salons\" "
+            "peut clôturer cet événement.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    close_event(evenement)
+    await cleanup_event_channels(interaction.guild, event)
+    await finalize_event_announcement(interaction.client, evenement, "Événement clôturé. Salons supprimés.")
+
+    await interaction.followup.send(f"Événement **{event['name']}** clôturé, salons supprimés. ✅", ephemeral=True)
+
+
+@tasks.loop(minutes=15)
+async def event_cleanup_task():
+    """Filet de sécurité : nettoie automatiquement les salons d'un événement non
+    clôturé manuellement, un certain délai après l'heure de l'événement."""
+    now_utc = datetime.now(timezone.utc)
+    for event in get_all_open_events():
+        if event["event_datetime"] + timedelta(hours=EVENT_AUTO_CLEANUP_HOURS) < now_utc:
+            guild = bot.get_guild(event["guild_id"])
+            if guild is not None:
+                await cleanup_event_channels(guild, event)
+            close_event(event["id"])
+            await finalize_event_announcement(
+                bot, event["id"], "Événement terminé (salons automatiquement supprimés)."
+            )
+
+
+@event_cleanup_task.before_loop
+async def before_event_cleanup_task():
+    await bot.wait_until_ready()
 
 
 # ---------------------------------------------------------------------------
@@ -906,6 +1487,7 @@ async def profil_classement(
 
 
 bot.tree.add_command(profil_group)
+bot.tree.add_command(event_group)
 
 
 if __name__ == "__main__":
