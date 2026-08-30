@@ -1429,6 +1429,169 @@ async def profil_view(interaction: discord.Interaction, membre: discord.Member =
     await interaction.response.send_message(embed=embed)
 
 
+# ---------------------------------------------------------------------------
+# Mini-jeu : Puissance 4
+# ---------------------------------------------------------------------------
+# Purement en mémoire (pas de sauvegarde en base) : une partie en cours est
+# perdue si le bot redémarre, ce qui est un compromis raisonnable pour un jeu
+# occasionnel entre deux membres.
+
+CONNECT4_ROWS = 6
+CONNECT4_COLS = 7
+CONNECT4_EMPTY_EMOJI = "⚪"
+CONNECT4_PLAYER_EMOJIS = {1: "🔴", 2: "🟡"}
+CONNECT4_COLUMN_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣"]
+
+
+class Connect4Game:
+    def __init__(self, player1: discord.Member, player2: discord.Member):
+        self.players = {1: player1, 2: player2}
+        self.board = [[0] * CONNECT4_COLS for _ in range(CONNECT4_ROWS)]
+        self.current = 1
+        self.winner = None  # None en cours, 1 ou 2 si victoire, "draw" si match nul
+
+    def drop(self, col: int) -> int | None:
+        """Place un jeton dans la colonne pour le joueur courant.
+        Renvoie la ligne où il atterrit, ou None si la colonne est pleine."""
+        for row in range(CONNECT4_ROWS - 1, -1, -1):
+            if self.board[row][col] == 0:
+                self.board[row][col] = self.current
+                return row
+        return None
+
+    def check_winner_at(self, row: int, col: int) -> bool:
+        player = self.board[row][col]
+        for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+            count = 1
+            for sign in (1, -1):
+                r, c = row + dr * sign, col + dc * sign
+                while 0 <= r < CONNECT4_ROWS and 0 <= c < CONNECT4_COLS and self.board[r][c] == player:
+                    count += 1
+                    r += dr * sign
+                    c += dc * sign
+            if count >= 4:
+                return True
+        return False
+
+    def is_full(self) -> bool:
+        return all(self.board[0][c] != 0 for c in range(CONNECT4_COLS))
+
+    def render(self) -> str:
+        header = "".join(CONNECT4_COLUMN_EMOJIS)
+        rows_txt = "\n".join(
+            "".join(CONNECT4_PLAYER_EMOJIS.get(cell, CONNECT4_EMPTY_EMOJI) for cell in row)
+            for row in self.board
+        )
+        return f"{header}\n{rows_txt}"
+
+
+def build_connect4_embed(game: Connect4Game) -> discord.Embed:
+    if game.winner == "draw":
+        title = "🤝 Match nul !"
+        color = 0x99AAB5
+    elif game.winner:
+        title = f"🏆 {game.players[game.winner].display_name} remporte la partie !"
+        color = EMBED_COLOR
+    else:
+        title = f"Au tour de {game.players[game.current].display_name} ({CONNECT4_PLAYER_EMOJIS[game.current]})"
+        color = EMBED_COLOR
+
+    embed = discord.Embed(title=title, description=game.render(), color=color)
+    embed.add_field(
+        name="Joueurs",
+        value=(
+            f"{CONNECT4_PLAYER_EMOJIS[1]} {game.players[1].mention}\n"
+            f"{CONNECT4_PLAYER_EMOJIS[2]} {game.players[2].mention}"
+        ),
+        inline=False,
+    )
+    return embed
+
+
+class Connect4View(discord.ui.View):
+    def __init__(self, game: Connect4Game):
+        super().__init__(timeout=600)  # partie abandonnée après 10 min d'inactivité
+        self.game = game
+        self.message: discord.Message | None = None
+
+        for col in range(CONNECT4_COLS):
+            button = discord.ui.Button(
+                label=str(col + 1), style=discord.ButtonStyle.primary, row=col // 4
+            )
+            button.callback = self._make_callback(col)
+            self.add_item(button)
+
+    def _make_callback(self, col: int):
+        async def callback(interaction: discord.Interaction):
+            await self.handle_move(interaction, col)
+        return callback
+
+    async def handle_move(self, interaction: discord.Interaction, col: int):
+        game = self.game
+        player_ids = (game.players[1].id, game.players[2].id)
+
+        if interaction.user.id not in player_ids:
+            await interaction.response.send_message("Cette partie ne te concerne pas.", ephemeral=True)
+            return
+
+        if interaction.user.id != game.players[game.current].id:
+            await interaction.response.send_message("Ce n'est pas ton tour !", ephemeral=True)
+            return
+
+        row = game.drop(col)
+        if row is None:
+            await interaction.response.send_message("Cette colonne est pleine, choisis-en une autre.", ephemeral=True)
+            return
+
+        if game.check_winner_at(row, col):
+            game.winner = game.current
+            self._disable_all()
+        elif game.is_full():
+            game.winner = "draw"
+            self._disable_all()
+        else:
+            game.current = 2 if game.current == 1 else 1
+
+        embed = build_connect4_embed(game)
+        await interaction.response.edit_message(embed=embed, view=self)
+        if game.winner:
+            self.stop()
+
+    def _disable_all(self):
+        for item in self.children:
+            item.disabled = True
+
+    async def on_timeout(self):
+        self._disable_all()
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.Forbidden):
+                pass
+
+
+@bot.tree.command(name="puissance4", description="Défier un membre à une partie de Puissance 4")
+@app_commands.describe(adversaire="Le membre que tu veux défier")
+async def puissance4(interaction: discord.Interaction, adversaire: discord.Member):
+    if adversaire.id == interaction.user.id:
+        await interaction.response.send_message("Tu ne peux pas te défier toi-même !", ephemeral=True)
+        return
+    if adversaire.bot:
+        await interaction.response.send_message("Tu ne peux pas défier un bot pour l'instant.", ephemeral=True)
+        return
+
+    game = Connect4Game(interaction.user, adversaire)
+    view = Connect4View(game)
+    embed = build_connect4_embed(game)
+
+    await interaction.response.send_message(
+        content=f"🔴🟡 {adversaire.mention}, tu es défié à une partie de Puissance 4 par {interaction.user.mention} !",
+        embed=embed,
+        view=view,
+    )
+    view.message = await interaction.original_response()
+
+
 bot.tree.add_command(profil_group)
 bot.tree.add_command(event_group)
 
