@@ -117,6 +117,70 @@ def resolve_link_url(service_key: str, raw_input: str) -> tuple[str | None, str 
     return service["url_template"].format(username=username), None
 
 
+# Reconnaît soit un emoji personnalisé Discord bien formé (<:nom:id> ou <a:nom:id>),
+# soit une séquence de caractères appartenant aux plages Unicode habituelles des
+# emojis (avec variation selector U+FE0F et zero-width joiner U+200D pour les
+# emojis composés comme 🇫🇷 ou 👨‍👩‍👧). Rejette tout ce qui ressemble à du texte
+# normal (lettres, chiffres, espaces), qui ferait planter l'API Discord si on
+# l'utilisait comme emoji d'un bouton ou d'une option de menu déroulant.
+_CUSTOM_EMOJI_RE = re.compile(r"^<a?:\w+:\d+>$")
+_EMOJI_CODEPOINT_RANGES = [
+    (0x1F300, 0x1FAFF),  # pictogrammes divers, symboles, extensions récentes
+    (0x2600, 0x27BF),    # symboles divers & dingbats
+    (0x2190, 0x21FF),    # flèches (utilisées comme emoji, ex: ↩️)
+    (0x2B00, 0x2BFF),    # symboles et flèches divers
+    (0x1F1E6, 0x1F1FF),  # indicateurs régionaux (composants des drapeaux)
+]
+_REGIONAL_INDICATOR_RANGE = (0x1F1E6, 0x1F1FF)
+_VARIATION_SELECTOR_16 = 0xFE0F
+_ZERO_WIDTH_JOINER = 0x200D
+
+
+def _codepoint_in_emoji_range(cp: int) -> bool:
+    return any(lo <= cp <= hi for lo, hi in _EMOJI_CODEPOINT_RANGES)
+
+
+def validate_emoji(raw: str | None) -> str | None:
+    """Vérifie qu'une chaîne fournie par un admin est UN SEUL emoji utilisable dans
+    un composant Discord (bouton, option de menu déroulant) — Discord n'accepte
+    qu'un seul emoji par composant, et rejette (avec toute l'interaction !) tout
+    composant dont l'emoji est invalide ou constitué de plusieurs caractères non
+    liés. Renvoie l'emoji si valide, ou None si absent/invalide."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    if _CUSTOM_EMOJI_RE.match(raw):
+        return raw
+
+    codepoints = [ord(ch) for ch in raw]
+
+    if _ZERO_WIDTH_JOINER in codepoints:
+        # Emoji composé (ex: famille 👨‍👩‍👧, métiers, couples) : chaque partie doit
+        # être soit un emoji de base, soit un séparateur (ZWJ ou variation selector).
+        if all(
+            cp in (_ZERO_WIDTH_JOINER, _VARIATION_SELECTOR_16) or _codepoint_in_emoji_range(cp)
+            for cp in codepoints
+        ):
+            return raw
+        return None
+
+    # Un variation selector-16 (️) ne compte pas comme un caractère à part entière.
+    meaningful = [cp for cp in codepoints if cp != _VARIATION_SELECTOR_16]
+
+    if len(meaningful) == 2 and all(
+        _REGIONAL_INDICATOR_RANGE[0] <= cp <= _REGIONAL_INDICATOR_RANGE[1] for cp in meaningful
+    ):
+        return raw  # drapeau (deux indicateurs régionaux, ex: 🇫🇷)
+
+    if len(meaningful) == 1 and _codepoint_in_emoji_range(meaningful[0]):
+        return raw
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Base de données (PostgreSQL, hébergée en externe pour survivre aux redéploiements)
 # ---------------------------------------------------------------------------
@@ -2005,7 +2069,9 @@ async def handle_role_toggle(interaction: discord.Interaction, menu_id: int, cat
 class RoleMenuCategorySelect(discord.ui.Select):
     def __init__(self, menu_id: int, categories: list[dict]):
         options = [
-            discord.SelectOption(label=c["label"][:100], value=str(c["id"]), emoji=c["emoji"] or None)
+            discord.SelectOption(
+                label=c["label"][:100], value=str(c["id"]), emoji=validate_emoji(c["emoji"])
+            )
             for c in categories
         ]
         super().__init__(placeholder="Choisis une catégorie...", options=options)
@@ -2028,7 +2094,7 @@ class RoleToggleButton(discord.ui.Button):
     def __init__(self, menu_id: int, category_id: int, role_entry: dict, owned: bool):
         super().__init__(
             label=role_entry["label"][:80],
-            emoji=role_entry["emoji"] or None,
+            emoji=validate_emoji(role_entry["emoji"]),
             style=discord.ButtonStyle.success if owned else discord.ButtonStyle.secondary,
         )
         self.menu_id = menu_id
@@ -2155,6 +2221,14 @@ async def rolemenu_categorie_ajouter(
         await interaction.followup.send("Menu introuvable.", ephemeral=True)
         return
 
+    if emoji is not None and validate_emoji(emoji) is None:
+        await interaction.followup.send(
+            "Cet emoji n'est pas valide. Utilise le sélecteur d'emoji de Discord "
+            "(tape `:` dans le champ pour en choisir un) ou laisse le champ vide.",
+            ephemeral=True,
+        )
+        return
+
     category_id = add_role_menu_category(menu, nom, emoji, exclusif)
     await interaction.followup.send(
         f"Catégorie **{nom}** ajoutée (id `{category_id}`). Ajoute des rôles avec `/rolemenu role-ajouter`.",
@@ -2188,6 +2262,14 @@ async def rolemenu_role_ajouter(
     category_row = get_role_menu_category(categorie)
     if category_row is None:
         await interaction.followup.send("Catégorie introuvable.", ephemeral=True)
+        return
+
+    if emoji is not None and validate_emoji(emoji) is None:
+        await interaction.followup.send(
+            "Cet emoji n'est pas valide. Utilise le sélecteur d'emoji de Discord "
+            "(tape `:` dans le champ pour en choisir un) ou laisse le champ vide.",
+            ephemeral=True,
+        )
         return
 
     warning = ""
