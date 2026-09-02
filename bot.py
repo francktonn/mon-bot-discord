@@ -1025,14 +1025,16 @@ async def finalize_event_announcement(bot_client: discord.Client, event_id: int,
 
 
 async def handle_event_join(interaction: discord.Interaction, event_id: int):
+    """L'appelant doit avoir déjà déferé la réponse à l'interaction (via
+    interaction.response.defer(ephemeral=True)) avant d'appeler cette fonction."""
     event = get_event(event_id)
     if event is None:
-        await interaction.response.send_message("Cet événement n'existe plus.", ephemeral=True)
+        await interaction.followup.send("Cet événement n'existe plus.", ephemeral=True)
         return
 
     ok, msg = add_participant(event_id, interaction.user.id)
     if not ok:
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True)
         return
 
     guild = interaction.guild
@@ -1046,21 +1048,23 @@ async def handle_event_join(interaction: discord.Interaction, event_id: int):
         pass
 
     lien = f" Rendez-vous sur {text_channel.mention}." if text_channel else ""
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Tu participes maintenant à **{event['name']}** !{lien}", ephemeral=True
     )
     await refresh_event_announcement(interaction.client, event_id)
 
 
 async def handle_event_leave(interaction: discord.Interaction, event_id: int):
+    """L'appelant doit avoir déjà déferé la réponse à l'interaction (via
+    interaction.response.defer(ephemeral=True)) avant d'appeler cette fonction."""
     event = get_event(event_id)
     if event is None:
-        await interaction.response.send_message("Cet événement n'existe plus.", ephemeral=True)
+        await interaction.followup.send("Cet événement n'existe plus.", ephemeral=True)
         return
 
     removed = remove_participant(event_id, interaction.user.id)
     if not removed:
-        await interaction.response.send_message("Tu ne participais pas à cet événement.", ephemeral=True)
+        await interaction.followup.send("Tu ne participais pas à cet événement.", ephemeral=True)
         return
 
     guild = interaction.guild
@@ -1081,7 +1085,7 @@ async def handle_event_leave(interaction: discord.Interaction, event_id: int):
     except discord.Forbidden:
         pass
 
-    await interaction.response.send_message(f"Tu ne participes plus à **{event['name']}**.", ephemeral=True)
+    await interaction.followup.send(f"Tu ne participes plus à **{event['name']}**.", ephemeral=True)
     await refresh_event_announcement(interaction.client, event_id)
 
 
@@ -1109,9 +1113,14 @@ class EventView(discord.ui.View):
         self.add_item(leave_button)
 
     async def join_callback(self, interaction: discord.Interaction):
+        # On accuse réception immédiatement (avant toute requête DB) pour ne
+        # jamais risquer de dépasser la fenêtre de 3 secondes imposée par Discord
+        # (ex: si la base Postgres met du temps à répondre après une mise en veille).
+        await interaction.response.defer(ephemeral=True)
         await handle_event_join(interaction, self.event_id)
 
     async def leave_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         await handle_event_leave(interaction, self.event_id)
 
 
@@ -1219,9 +1228,13 @@ async def event_list(interaction: discord.Interaction):
         await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
         return
 
+    # On accuse réception immédiatement (avant toute requête DB) pour ne jamais
+    # risquer de dépasser la fenêtre de 3 secondes imposée par Discord.
+    await interaction.response.defer()
+
     events = get_open_events(interaction.guild_id)
     if not events:
-        await interaction.response.send_message("Aucun événement à venir sur ce serveur.", ephemeral=True)
+        await interaction.followup.send("Aucun événement à venir sur ce serveur.", ephemeral=True)
         return
 
     lines = []
@@ -1232,7 +1245,7 @@ async def event_list(interaction: discord.Interaction):
         lines.append(f"📅 **{e['name']}** — {dt_paris.strftime('%d/%m/%Y à %H:%M')} — {limite} participant(s)")
 
     embed = discord.Embed(title="🗓️ Événements à venir", description="\n".join(lines), color=EMBED_COLOR)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @event_group.command(name="close", description="Clôturer un événement et supprimer ses salons")
@@ -1243,22 +1256,24 @@ async def event_close(interaction: discord.Interaction, evenement: int):
         await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
         return
 
+    # On accuse réception immédiatement (avant toute requête DB) pour ne jamais
+    # risquer de dépasser la fenêtre de 3 secondes imposée par Discord.
+    await interaction.response.defer(ephemeral=True)
+
     event = get_event(evenement)
     if event is None or event["guild_id"] != interaction.guild_id:
-        await interaction.response.send_message("Événement introuvable.", ephemeral=True)
+        await interaction.followup.send("Événement introuvable.", ephemeral=True)
         return
 
     is_organizer = interaction.user.id == event["organizer_id"]
     is_admin = interaction.user.guild_permissions.manage_channels
     if not (is_organizer or is_admin):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Seul l'organisateur ou un membre avec la permission \"Gérer les salons\" "
             "peut clôturer cet événement.",
             ephemeral=True,
         )
         return
-
-    await interaction.response.defer(ephemeral=True)
 
     close_event(evenement)
     await cleanup_event_channels(interaction.guild, event)
@@ -1305,14 +1320,15 @@ class BioModal(discord.ui.Modal, title="Modifier ma bio"):
         super().__init__()
         self.guild_id = guild_id
         self.user_id = user_id
-        # Pré-remplit le formulaire avec la bio actuelle si elle existe
-        row, _ = fetch_profile(guild_id, user_id)
-        if row and row[0]:
-            self.bio_input.default = row[0]
+        # Remarque : on ne pré-remplit plus le formulaire avec la bio actuelle,
+        # car ça nécessiterait une requête DB avant d'afficher le modal — impossible
+        # à différer (Discord exige que le modal soit la toute première réponse à
+        # l'interaction) et donc risqué en cas de latence de la base.
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         update_field(self.guild_id, self.user_id, "bio", str(self.bio_input.value))
-        await interaction.response.send_message("Ta bio a été mise à jour ✅", ephemeral=True)
+        await interaction.followup.send("Ta bio a été mise à jour ✅", ephemeral=True)
 
 
 def is_valid_day_month(day: int, month: int) -> bool:
@@ -1335,33 +1351,33 @@ class BirthdayModal(discord.ui.Modal, title="Mon anniversaire"):
         super().__init__()
         self.guild_id = guild_id
         self.user_id = user_id
-        row, _ = fetch_profile(guild_id, user_id)
-        if row and row[5] and row[6]:
-            self.date_input.default = f"{row[5]:02d}/{row[6]:02d}"
+        # Remarque : pas de pré-remplissage depuis la DB ici pour la même raison
+        # que BioModal (voir plus haut) — on ne peut pas différer avant un modal.
         self.date_input.placeholder = "ex: 25/12 (laisse vide pour retirer)"
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         raw = str(self.date_input.value).strip()
 
         if not raw:
             clear_birthday(self.guild_id, self.user_id)
-            await interaction.response.send_message("Anniversaire retiré de ton profil.", ephemeral=True)
+            await interaction.followup.send("Anniversaire retiré de ton profil.", ephemeral=True)
             return
 
         match = re.fullmatch(r"(\d{1,2})\s*/\s*(\d{1,2})", raw)
         if not match:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Format invalide. Utilise JJ/MM, par exemple 25/12.", ephemeral=True
             )
             return
 
         day, month = int(match.group(1)), int(match.group(2))
         if not is_valid_day_month(day, month):
-            await interaction.response.send_message("Cette date n'existe pas.", ephemeral=True)
+            await interaction.followup.send("Cette date n'existe pas.", ephemeral=True)
             return
 
         set_birthday(self.guild_id, self.user_id, day, month)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"🎂 Anniversaire enregistré : **{day} {MONTHS_FR[month - 1]}**", ephemeral=True
         )
 
@@ -1382,17 +1398,18 @@ class LinkServiceModal(discord.ui.Modal):
         self.pseudo_input.label = f"Pseudo ou URL {service['label']}"
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         service = LINK_SERVICES[self.service_key]
         url, error = resolve_link_url(self.service_key, str(self.pseudo_input.value))
         if error:
-            await interaction.response.send_message(error, ephemeral=True)
+            await interaction.followup.send(error, ephemeral=True)
             return
 
         ok, msg = add_link(self.guild_id, self.user_id, service["label"], url)
         if not ok:
-            await interaction.response.send_message(msg, ephemeral=True)
+            await interaction.followup.send(msg, ephemeral=True)
             return
-        await interaction.response.send_message(f"Lien **{service['label']}** enregistré ✅", ephemeral=True)
+        await interaction.followup.send(f"Lien **{service['label']}** enregistré ✅", ephemeral=True)
 
 
 class LinkServiceSelect(discord.ui.Select):
@@ -1427,9 +1444,10 @@ class LinkRemoveSelect(discord.ui.Select):
         self.user_id = user_id
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         label = self.values[0]
         remove_link(self.guild_id, self.user_id, label)
-        await interaction.response.edit_message(content=f"Lien **{label}** supprimé ✅", view=None)
+        await interaction.edit_original_response(content=f"Lien **{label}** supprimé ✅", view=None)
 
 
 class LinkRemoveView(discord.ui.View):
@@ -1446,8 +1464,9 @@ class ConfirmDeleteView(discord.ui.View):
 
     @discord.ui.button(label="Confirmer la suppression", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         delete_profile(self.guild_id, self.user_id)
-        await interaction.response.edit_message(content="🗑️ Ton profil a été supprimé.", view=None)
+        await interaction.edit_original_response(content="🗑️ Ton profil a été supprimé.", view=None)
 
     @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1510,9 +1529,10 @@ class ColorSelect(discord.ui.Select):
         self.user_id = user_id
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         hexcode = self.values[0]
         update_field(self.guild_id, self.user_id, "profile_color", int(hexcode, 16))
-        await interaction.response.edit_message(content="Couleur de ton profil mise à jour ✅", view=None)
+        await interaction.edit_original_response(content="Couleur de ton profil mise à jour ✅", view=None)
 
 
 class ColorSelectView(discord.ui.View):
@@ -1586,12 +1606,13 @@ class ProfileEditSelect(discord.ui.Select):
             )
 
         elif choice == "lien_supprimer":
+            await interaction.response.defer(ephemeral=True)
             _, links = fetch_profile(self.guild_id, self.user_id)
             if not links:
-                await interaction.response.send_message("Tu n'as encore aucun lien à supprimer.", ephemeral=True)
+                await interaction.followup.send("Tu n'as encore aucun lien à supprimer.", ephemeral=True)
                 return
             view = LinkRemoveView(self.guild_id, self.user_id, links)
-            await interaction.response.send_message("Sélectionne le lien à supprimer :", view=view, ephemeral=True)
+            await interaction.followup.send("Sélectionne le lien à supprimer :", view=view, ephemeral=True)
 
         elif choice == "supprimer":
             view = ConfirmDeleteView(self.guild_id, self.user_id)
@@ -1626,23 +1647,24 @@ async def profil_editor(interaction: discord.Interaction):
 @profil_group.command(name="view", description="Affiche ton profil ou celui d'un autre membre")
 @app_commands.describe(membre="Le membre dont tu veux voir le profil (optionnel)")
 async def profil_view(interaction: discord.Interaction, membre: discord.Member = None):
+    # On accuse réception immédiatement (avant toute requête DB) pour ne jamais
+    # risquer de dépasser la fenêtre de 3 secondes imposée par Discord.
+    await interaction.response.defer()
+
     target = membre or interaction.user
     row, links = fetch_profile(interaction.guild_id, target.id)
 
     if row is None and not links:
         if target == interaction.user:
-            await interaction.response.send_message(
-                "Tu n'as pas encore de profil. Utilise `/profil editor` pour en créer un !",
-                ephemeral=True,
+            await interaction.edit_original_response(
+                content="Tu n'as pas encore de profil. Utilise `/profil editor` pour en créer un !"
             )
         else:
-            await interaction.response.send_message(
-                f"{target.display_name} n'a pas encore de profil.", ephemeral=True
-            )
+            await interaction.edit_original_response(content=f"{target.display_name} n'a pas encore de profil.")
         return
 
     embed = build_profile_embed(target, row, links)
-    await interaction.response.send_message(embed=embed)
+    await interaction.edit_original_response(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -1844,57 +1866,63 @@ def build_rolemenu_category_embed(
 
 
 async def show_rolemenu_home(interaction: discord.Interaction, menu_id: int, first_open: bool = False):
+    """Affiche l'accueil du menu (liste des catégories).
+    L'appelant doit avoir déjà déferé la réponse à l'interaction avant d'appeler
+    cette fonction (via interaction.response.defer()), pour ne jamais risquer de
+    dépasser la fenêtre de 3 secondes de Discord avec les requêtes à la base."""
     menu = get_role_menu(menu_id)
     if menu is None:
         content = "Ce menu de rôles n'existe plus."
         if first_open:
-            await interaction.response.send_message(content, ephemeral=True)
+            await interaction.followup.send(content, ephemeral=True)
         else:
-            await interaction.response.edit_message(content=content, embed=None, view=None)
+            await interaction.edit_original_response(content=content, embed=None, view=None)
         return
 
     categories = get_role_menu_categories(menu_id)
     if not categories:
         content = "Ce menu n'a pas encore de catégories configurées."
         if first_open:
-            await interaction.response.send_message(content, ephemeral=True)
+            await interaction.followup.send(content, ephemeral=True)
         else:
-            await interaction.response.edit_message(content=content, embed=None, view=None)
+            await interaction.edit_original_response(content=content, embed=None, view=None)
         return
 
     embed = build_rolemenu_home_embed(menu)
     view = RoleMenuCategoryView(menu_id, categories)
 
     if first_open:
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     else:
-        await interaction.response.edit_message(content=None, embed=embed, view=view)
+        await interaction.edit_original_response(content=None, embed=embed, view=view)
 
 
 async def show_role_category(interaction: discord.Interaction, menu_id: int, category_id: int):
+    """L'appelant doit avoir déjà déferé la réponse à l'interaction (voir show_rolemenu_home)."""
     category = get_role_menu_category(category_id)
     if category is None:
-        await interaction.response.edit_message(content="Cette catégorie n'existe plus.", embed=None, view=None)
+        await interaction.edit_original_response(content="Cette catégorie n'existe plus.", embed=None, view=None)
         return
 
     roles = get_role_menu_roles(category_id)
     embed = build_rolemenu_category_embed(category, roles, interaction.user)
     view = RoleMenuRoleView(menu_id, category_id, roles, interaction.user)
-    await interaction.response.edit_message(embed=embed, view=view)
+    await interaction.edit_original_response(embed=embed, view=view)
 
 
 async def handle_role_toggle(interaction: discord.Interaction, menu_id: int, category_id: int, role_entry_id: int):
+    """L'appelant doit avoir déjà déferé la réponse à l'interaction (voir show_rolemenu_home)."""
     role_entry = get_role_menu_role(role_entry_id)
     category = get_role_menu_category(category_id)
     if role_entry is None or category is None:
-        await interaction.response.send_message("Ce rôle n'est plus configuré.", ephemeral=True)
+        await interaction.edit_original_response(content="Ce rôle n'est plus configuré.", embed=None, view=None)
         return
 
     guild = interaction.guild
     discord_role = guild.get_role(role_entry["discord_role_id"])
     if discord_role is None:
-        await interaction.response.send_message(
-            "Le rôle Discord associé n'existe plus, préviens un admin.", ephemeral=True
+        await interaction.edit_original_response(
+            content="Le rôle Discord associé n'existe plus, préviens un admin.", embed=None, view=None
         )
         return
 
@@ -1920,10 +1948,13 @@ async def handle_role_toggle(interaction: discord.Interaction, menu_id: int, cat
             await member.add_roles(discord_role, reason="Ajouté via le menu de rôles")
             add_role_assignment(role_entry_id, member.id)
     except discord.Forbidden:
-        await interaction.response.send_message(
-            "Je n'ai pas la permission de gérer ce rôle. Vérifie que mon propre rôle est bien "
-            "placé au-dessus dans la hiérarchie des rôles du serveur.",
-            ephemeral=True,
+        await interaction.edit_original_response(
+            content=(
+                "Je n'ai pas la permission de gérer ce rôle. Vérifie que mon propre rôle est bien "
+                "placé au-dessus dans la hiérarchie des rôles du serveur."
+            ),
+            embed=None,
+            view=None,
         )
         return
 
@@ -1941,6 +1972,9 @@ class RoleMenuCategorySelect(discord.ui.Select):
         self.menu_id = menu_id
 
     async def callback(self, interaction: discord.Interaction):
+        # On accuse réception immédiatement (avant toute requête DB) pour ne
+        # jamais risquer de dépasser la fenêtre de 3 secondes imposée par Discord.
+        await interaction.response.defer()
         await show_role_category(interaction, self.menu_id, int(self.values[0]))
 
 
@@ -1962,6 +1996,7 @@ class RoleToggleButton(discord.ui.Button):
         self.role_entry_id = role_entry["id"]
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         await handle_role_toggle(interaction, self.menu_id, self.category_id, self.role_entry_id)
 
 
@@ -1971,6 +2006,7 @@ class RoleMenuBackButton(discord.ui.Button):
         self.menu_id = menu_id
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         await show_rolemenu_home(interaction, self.menu_id)
 
 
@@ -1999,6 +2035,10 @@ class RoleMenuOpenView(discord.ui.View):
         self.menu_id = menu_id
 
     async def open_callback(self, interaction: discord.Interaction):
+        # On accuse réception immédiatement (avant toute requête DB) pour ne
+        # jamais risquer de dépasser la fenêtre de 3 secondes imposée par Discord
+        # (ex: si la base Postgres met du temps à répondre après une mise en veille).
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await show_rolemenu_home(interaction, self.menu_id, first_open=True)
 
 
@@ -2040,8 +2080,12 @@ async def rolemenu_creer(interaction: discord.Interaction, nom: str):
         )
         return
 
+    # On accuse réception immédiatement (avant toute requête DB) pour ne jamais
+    # risquer de dépasser la fenêtre de 3 secondes imposée par Discord.
+    await interaction.response.defer(ephemeral=True)
+
     menu_id = create_role_menu(interaction.guild_id, nom, interaction.user.id)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Menu **{nom}** créé (id `{menu_id}`). Ajoute des catégories avec `/rolemenu categorie-ajouter`.",
         ephemeral=True,
     )
@@ -2064,13 +2108,15 @@ async def rolemenu_categorie_ajouter(
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     menu_row = get_role_menu(menu)
     if menu_row is None or menu_row["guild_id"] != interaction.guild_id:
-        await interaction.response.send_message("Menu introuvable.", ephemeral=True)
+        await interaction.followup.send("Menu introuvable.", ephemeral=True)
         return
 
     category_id = add_role_menu_category(menu, nom, emoji, exclusif)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Catégorie **{nom}** ajoutée (id `{category_id}`). Ajoute des rôles avec `/rolemenu role-ajouter`.",
         ephemeral=True,
     )
@@ -2097,9 +2143,11 @@ async def rolemenu_role_ajouter(
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     category_row = get_role_menu_category(categorie)
     if category_row is None:
-        await interaction.response.send_message("Catégorie introuvable.", ephemeral=True)
+        await interaction.followup.send("Catégorie introuvable.", ephemeral=True)
         return
 
     warning = ""
@@ -2111,7 +2159,7 @@ async def rolemenu_role_ajouter(
         )
 
     role_entry_id = add_role_menu_role(categorie, role.id, role.name, emoji, description)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Rôle **{role.name}** ajouté à la catégorie (id `{role_entry_id}`).{warning}", ephemeral=True
     )
 
@@ -2120,14 +2168,16 @@ async def rolemenu_role_ajouter(
 @app_commands.describe(menu="Le menu à prévisualiser")
 @app_commands.autocomplete(menu=rolemenu_autocomplete)
 async def rolemenu_apercu(interaction: discord.Interaction, menu: int):
+    await interaction.response.defer(ephemeral=True)
+
     menu_row = get_role_menu(menu)
     if menu_row is None or menu_row["guild_id"] != interaction.guild_id:
-        await interaction.response.send_message("Menu introuvable.", ephemeral=True)
+        await interaction.followup.send("Menu introuvable.", ephemeral=True)
         return
 
     categories = get_role_menu_categories(menu)
     if not categories:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Le menu **{menu_row['name']}** n'a encore aucune catégorie.", ephemeral=True
         )
         return
@@ -2144,7 +2194,7 @@ async def rolemenu_apercu(interaction: discord.Interaction, menu: int):
             lines.append(f"　{(r['emoji'] + ' ') if r['emoji'] else ''}{r['label']}{desc}")
 
     embed = discord.Embed(title=f"Aperçu — {menu_row['name']}", description="\n".join(lines), color=EMBED_COLOR)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @role_menu_group.command(name="publier", description="Publier le menu de rôles dans ce salon")
@@ -2157,14 +2207,16 @@ async def rolemenu_publier(interaction: discord.Interaction, menu: int):
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     menu_row = get_role_menu(menu)
     if menu_row is None or menu_row["guild_id"] != interaction.guild_id:
-        await interaction.response.send_message("Menu introuvable.", ephemeral=True)
+        await interaction.followup.send("Menu introuvable.", ephemeral=True)
         return
 
     categories = get_role_menu_categories(menu)
     if not categories:
-        await interaction.response.send_message("Ajoute au moins une catégorie avant de publier ce menu.", ephemeral=True)
+        await interaction.followup.send("Ajoute au moins une catégorie avant de publier ce menu.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -2179,7 +2231,7 @@ async def rolemenu_publier(interaction: discord.Interaction, menu: int):
     message = await interaction.channel.send(embed=embed, view=view)
     set_role_menu_message(menu, interaction.channel.id, message.id)
 
-    await interaction.response.send_message("Menu publié ✅", ephemeral=True)
+    await interaction.followup.send("Menu publié ✅", ephemeral=True)
 
 
 bot.tree.add_command(profil_group)
