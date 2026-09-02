@@ -194,6 +194,7 @@ def init_db():
                 max_participants INTEGER,
                 text_channel_id BIGINT,
                 voice_channel_id BIGINT,
+                event_role_id BIGINT,
                 announcement_channel_id BIGINT,
                 announcement_message_id BIGINT,
                 status TEXT NOT NULL DEFAULT 'open',
@@ -201,6 +202,7 @@ def init_db():
             )
             """
         )
+        cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS event_role_id BIGINT")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS event_participants (
@@ -208,6 +210,55 @@ def init_db():
                 user_id BIGINT NOT NULL,
                 joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 PRIMARY KEY (event_id, user_id)
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS role_menus (
+                id SERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                name TEXT NOT NULL,
+                channel_id BIGINT,
+                message_id BIGINT,
+                created_by BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS role_menu_categories (
+                id SERIAL PRIMARY KEY,
+                menu_id INTEGER NOT NULL REFERENCES role_menus(id) ON DELETE CASCADE,
+                label TEXT NOT NULL,
+                emoji TEXT,
+                exclusive BOOLEAN NOT NULL DEFAULT FALSE,
+                position INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS role_menu_roles (
+                id SERIAL PRIMARY KEY,
+                category_id INTEGER NOT NULL REFERENCES role_menu_categories(id) ON DELETE CASCADE,
+                discord_role_id BIGINT NOT NULL,
+                label TEXT NOT NULL,
+                emoji TEXT,
+                description TEXT,
+                position INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS role_menu_assignments (
+                role_entry_id INTEGER NOT NULL REFERENCES role_menu_roles(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                assigned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (role_entry_id, user_id)
             )
             """
         )
@@ -302,6 +353,11 @@ def set_event_channels(event_id: int, text_channel_id: int, voice_channel_id: in
         )
 
 
+def set_event_role(event_id: int, role_id: int):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute("UPDATE events SET event_role_id = %s WHERE id = %s", (role_id, event_id))
+
+
 def set_event_announcement(event_id: int, channel_id: int, message_id: int):
     with get_db() as db, db.cursor() as cur:
         cur.execute(
@@ -382,6 +438,138 @@ def get_participant_count(event_id: int) -> int:
 def close_event(event_id: int, new_status: str = "completed"):
     with get_db() as db, db.cursor() as cur:
         cur.execute("UPDATE events SET status = %s WHERE id = %s", (new_status, event_id))
+
+
+# ---------------------------------------------------------------------------
+# Base de données : menus de sélection de rôles ("Loadout")
+# ---------------------------------------------------------------------------
+
+def create_role_menu(guild_id: int, name: str, created_by: int) -> int:
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO role_menus (guild_id, name, created_by) VALUES (%s, %s, %s) RETURNING id",
+            (guild_id, name, created_by),
+        )
+        return cur.fetchone()[0]
+
+
+def get_role_menu(menu_id: int) -> dict | None:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM role_menus WHERE id = %s", (menu_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_role_menus(guild_id: int) -> list[dict]:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM role_menus WHERE guild_id = %s ORDER BY id", (guild_id,))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_all_published_role_menus() -> list[dict]:
+    """Tous les menus déjà publiés (message_id renseigné), tous serveurs confondus —
+    pour réenregistrer le bouton persistant au démarrage du bot."""
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM role_menus WHERE message_id IS NOT NULL")
+        return [dict(r) for r in cur.fetchall()]
+
+
+def set_role_menu_message(menu_id: int, channel_id: int, message_id: int):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "UPDATE role_menus SET channel_id = %s, message_id = %s WHERE id = %s",
+            (channel_id, message_id, menu_id),
+        )
+
+
+def add_role_menu_category(menu_id: int, label: str, emoji: str | None, exclusive: bool) -> int:
+    with get_db() as db, db.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM role_menu_categories WHERE menu_id = %s", (menu_id,))
+        position = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO role_menu_categories (menu_id, label, emoji, exclusive, position) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (menu_id, label, emoji, exclusive, position),
+        )
+        return cur.fetchone()[0]
+
+
+def get_role_menu_categories(menu_id: int) -> list[dict]:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM role_menu_categories WHERE menu_id = %s ORDER BY position", (menu_id,))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_role_menu_category(category_id: int) -> dict | None:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM role_menu_categories WHERE id = %s", (category_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_role_menu_categories_for_guild(guild_id: int) -> list[dict]:
+    """Toutes les catégories de tous les menus d'un serveur, pour l'autocomplétion."""
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT c.* FROM role_menu_categories c
+            JOIN role_menus m ON m.id = c.menu_id
+            WHERE m.guild_id = %s
+            ORDER BY c.menu_id, c.position
+            """,
+            (guild_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def add_role_menu_role(
+    category_id: int, discord_role_id: int, label: str, emoji: str | None, description: str | None
+) -> int:
+    with get_db() as db, db.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM role_menu_roles WHERE category_id = %s", (category_id,))
+        position = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO role_menu_roles (category_id, discord_role_id, label, emoji, description, position) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            (category_id, discord_role_id, label, emoji, description, position),
+        )
+        return cur.fetchone()[0]
+
+
+def get_role_menu_roles(category_id: int) -> list[dict]:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM role_menu_roles WHERE category_id = %s ORDER BY position", (category_id,))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_role_menu_role(role_entry_id: int) -> dict | None:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM role_menu_roles WHERE id = %s", (role_entry_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def add_role_assignment(role_entry_id: int, user_id: int):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO role_menu_assignments (role_entry_id, user_id) VALUES (%s, %s) "
+            "ON CONFLICT (role_entry_id, user_id) DO NOTHING",
+            (role_entry_id, user_id),
+        )
+
+
+def remove_role_assignment(role_entry_id: int, user_id: int):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM role_menu_assignments WHERE role_entry_id = %s AND user_id = %s",
+            (role_entry_id, user_id),
+        )
+
+
+def get_role_assignment_count(role_entry_id: int) -> int:
+    with get_db() as db, db.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM role_menu_assignments WHERE role_entry_id = %s", (role_entry_id,))
+        return cur.fetchone()[0]
 
 
 def fetch_profile(guild_id: int, user_id: int):
@@ -491,9 +679,9 @@ voice_sessions: dict[tuple[int, int], float] = {}
 # plusieurs fois (reconnexions Discord).
 _webserver_started = False
 
-# Empêche de réenregistrer plusieurs fois les vues persistantes des événements
-# si on_ready se déclenche plusieurs fois (reconnexions Discord).
-_event_views_registered = False
+# Empêche de réenregistrer plusieurs fois les vues persistantes (événements,
+# menus de rôles) si on_ready se déclenche plusieurs fois (reconnexions Discord).
+_persistent_views_registered = False
 
 
 async def _health_handler(request: web.Request) -> web.Response:
@@ -606,14 +794,17 @@ async def on_ready():
     if not event_cleanup_task.is_running():
         event_cleanup_task.start()
 
-    # Réenregistre les boutons "Participer"/"Se désister" de tous les événements
-    # encore ouverts, pour qu'ils continuent de fonctionner après un redémarrage
-    # ou un redéploiement du bot (les vues persistantes ne survivent pas d'elles-mêmes).
-    global _event_views_registered
-    if not _event_views_registered:
-        _event_views_registered = True
+    # Réenregistre les boutons "Participer"/"Se désister" des événements encore
+    # ouverts et "Ouvrir mon inventaire" des menus de rôles publiés, pour qu'ils
+    # continuent de fonctionner après un redémarrage ou un redéploiement du bot
+    # (les vues persistantes ne survivent pas d'elles-mêmes).
+    global _persistent_views_registered
+    if not _persistent_views_registered:
+        _persistent_views_registered = True
         for event in get_all_open_events():
             bot.add_view(EventView(event["id"]))
+        for menu in get_all_published_role_menus():
+            bot.add_view(RoleMenuOpenView(menu["id"]))
 
     # Si le bot redémarre pendant que des membres sont déjà en vocal,
     # on démarre leur chrono maintenant pour ne pas perdre le suivi.
@@ -721,9 +912,18 @@ def build_event_embed(
     return embed
 
 
-async def create_event_channels(
+async def create_event_role_and_channels(
     guild: discord.Guild, event_name: str, organizer: discord.Member
-) -> tuple[discord.TextChannel, discord.VoiceChannel]:
+) -> tuple[discord.Role, discord.TextChannel, discord.VoiceChannel]:
+    """Crée un rôle Discord temporaire dédié à l'événement (attribué aux participants
+    au fil de l'eau), puis les salons temporaires dont l'accès repose sur ce rôle
+    plutôt que sur des permissions par membre — plus propre et plus facile à nettoyer."""
+    event_role = await guild.create_role(
+        name=f"🎉 {event_name}"[:100],
+        mentionable=True,
+        reason=f"Rôle d'événement créé par {organizer}",
+    )
+
     # On utilise la catégorie fixe configurée (EVENT_CATEGORY_ID) si elle existe
     # bien sur ce serveur ; sinon on retombe sur une recherche/création par nom.
     category = guild.get_channel(EVENT_CATEGORY_ID)
@@ -737,7 +937,7 @@ async def create_event_channels(
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True, connect=True),
-        organizer: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True, speak=True),
+        event_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True, speak=True),
     }
 
     text_channel = await guild.create_text_channel(
@@ -748,7 +948,7 @@ async def create_event_channels(
         f"🔊 {event_name}"[:100], category=category, overwrites=overwrites,
         reason=f"Événement créé par {organizer}",
     )
-    return text_channel, voice_channel
+    return event_role, text_channel, voice_channel
 
 
 async def cleanup_event_channels(guild: discord.Guild, event: dict):
@@ -759,6 +959,15 @@ async def cleanup_event_channels(guild: discord.Guild, event: dict):
         if channel is not None:
             try:
                 await channel.delete(reason="Événement terminé")
+            except (discord.Forbidden, discord.NotFound):
+                pass
+
+    role_id = event.get("event_role_id")
+    if role_id:
+        role = guild.get_role(role_id)
+        if role is not None:
+            try:
+                await role.delete(reason="Événement terminé")
             except (discord.Forbidden, discord.NotFound):
                 pass
 
@@ -828,13 +1037,11 @@ async def handle_event_join(interaction: discord.Interaction, event_id: int):
 
     guild = interaction.guild
     text_channel = guild.get_channel(event["text_channel_id"]) if event["text_channel_id"] else None
-    voice_channel = guild.get_channel(event["voice_channel_id"]) if event["voice_channel_id"] else None
+    role = guild.get_role(event["event_role_id"]) if event["event_role_id"] else None
 
     try:
-        if text_channel:
-            await text_channel.set_permissions(interaction.user, view_channel=True, send_messages=True)
-        if voice_channel:
-            await voice_channel.set_permissions(interaction.user, view_channel=True, connect=True, speak=True)
+        if role:
+            await interaction.user.add_roles(role, reason="Participation à un événement")
     except discord.Forbidden:
         pass
 
@@ -857,19 +1064,20 @@ async def handle_event_leave(interaction: discord.Interaction, event_id: int):
         return
 
     guild = interaction.guild
-    text_channel = guild.get_channel(event["text_channel_id"]) if event["text_channel_id"] else None
     voice_channel = guild.get_channel(event["voice_channel_id"]) if event["voice_channel_id"] else None
+    role = guild.get_role(event["event_role_id"]) if event["event_role_id"] else None
 
     try:
-        if text_channel:
-            await text_channel.set_permissions(interaction.user, overwrite=None)
-        if voice_channel:
-            await voice_channel.set_permissions(interaction.user, overwrite=None)
-            # Si la personne est déjà connectée au salon vocal de l'événement, on la déconnecte
-            # (le retrait de la permission n'éjecte pas automatiquement quelqu'un déjà connecté).
-            member = guild.get_member(interaction.user.id)
-            if member and member.voice and member.voice.channel and member.voice.channel.id == voice_channel.id:
-                await member.move_to(None)
+        if role:
+            await interaction.user.remove_roles(role, reason="Désistement d'un événement")
+        # Si la personne est déjà connectée au salon vocal de l'événement, on la déconnecte
+        # (le retrait du rôle n'éjecte pas automatiquement quelqu'un déjà connecté).
+        member = guild.get_member(interaction.user.id)
+        if (
+            voice_channel and member and member.voice
+            and member.voice.channel and member.voice.channel.id == voice_channel.id
+        ):
+            await member.move_to(None)
     except discord.Forbidden:
         pass
 
@@ -969,11 +1177,14 @@ async def event_create(
     await interaction.response.defer(thinking=True)
 
     try:
-        text_channel, voice_channel = await create_event_channels(interaction.guild, nom, interaction.user)
+        event_role, text_channel, voice_channel = await create_event_role_and_channels(
+            interaction.guild, nom, interaction.user
+        )
     except discord.Forbidden:
         await interaction.followup.send(
-            "Je n'ai pas la permission de créer des salons sur ce serveur. "
-            "Vérifie que j'ai la permission \"Gérer les salons\"."
+            "Je n'ai pas la permission de créer des rôles/salons sur ce serveur. "
+            "Vérifie que j'ai les permissions \"Gérer les salons\" et \"Gérer les rôles\", "
+            "et que mon propre rôle est bien placé dans la hiérarchie du serveur."
         )
         return
 
@@ -986,9 +1197,14 @@ async def event_create(
         max_participants,
     )
     set_event_channels(event_id, text_channel.id, voice_channel.id)
+    set_event_role(event_id, event_role.id)
 
     # L'organisateur participe automatiquement à son propre événement.
     add_participant(event_id, interaction.user.id)
+    try:
+        await interaction.user.add_roles(event_role, reason="Organisateur de l'événement")
+    except discord.Forbidden:
+        pass
 
     embed = build_event_embed(nom, description, event_dt, max_participants, 1, interaction.user.id)
     view = EventView(event_id)
@@ -1592,8 +1808,383 @@ async def puissance4(interaction: discord.Interaction, adversaire: discord.Membe
     view.message = await interaction.original_response()
 
 
+# ---------------------------------------------------------------------------
+# Menus de sélection de rôles ("Loadout") : embeds, vues interactives, commandes
+# ---------------------------------------------------------------------------
+
+def build_rolemenu_home_embed(menu: dict) -> discord.Embed:
+    return discord.Embed(
+        title=f"🎯 {menu['name']}",
+        description="Choisis une catégorie pour voir les rôles disponibles.",
+        color=EMBED_COLOR,
+    )
+
+
+def build_rolemenu_category_embed(
+    category: dict, roles: list[dict], member: discord.Member
+) -> discord.Embed:
+    owned_ids = {r.id for r in member.roles}
+    lines = []
+    for r in roles:
+        has_it = r["discord_role_id"] in owned_ids
+        count = get_role_assignment_count(r["id"])
+        marker = "✅" if has_it else "⬜"
+        emoji = f"{r['emoji']} " if r["emoji"] else ""
+        desc = f" — {r['description']}" if r["description"] else ""
+        lines.append(f"{marker} {emoji}**{r['label']}**{desc} · {count} membre(s)")
+
+    embed = discord.Embed(
+        title=f"{category['emoji'] + ' ' if category['emoji'] else ''}{category['label']}",
+        description="\n".join(lines) if lines else "*Aucun rôle configuré dans cette catégorie.*",
+        color=EMBED_COLOR,
+    )
+    mode = "Un seul choix actif à la fois" if category["exclusive"] else "Plusieurs choix cumulables"
+    embed.set_footer(text=f"{mode} • Clique sur un bouton pour équiper/retirer un rôle")
+    return embed
+
+
+async def show_rolemenu_home(interaction: discord.Interaction, menu_id: int, first_open: bool = False):
+    menu = get_role_menu(menu_id)
+    if menu is None:
+        content = "Ce menu de rôles n'existe plus."
+        if first_open:
+            await interaction.response.send_message(content, ephemeral=True)
+        else:
+            await interaction.response.edit_message(content=content, embed=None, view=None)
+        return
+
+    categories = get_role_menu_categories(menu_id)
+    if not categories:
+        content = "Ce menu n'a pas encore de catégories configurées."
+        if first_open:
+            await interaction.response.send_message(content, ephemeral=True)
+        else:
+            await interaction.response.edit_message(content=content, embed=None, view=None)
+        return
+
+    embed = build_rolemenu_home_embed(menu)
+    view = RoleMenuCategoryView(menu_id, categories)
+
+    if first_open:
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    else:
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+
+async def show_role_category(interaction: discord.Interaction, menu_id: int, category_id: int):
+    category = get_role_menu_category(category_id)
+    if category is None:
+        await interaction.response.edit_message(content="Cette catégorie n'existe plus.", embed=None, view=None)
+        return
+
+    roles = get_role_menu_roles(category_id)
+    embed = build_rolemenu_category_embed(category, roles, interaction.user)
+    view = RoleMenuRoleView(menu_id, category_id, roles, interaction.user)
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def handle_role_toggle(interaction: discord.Interaction, menu_id: int, category_id: int, role_entry_id: int):
+    role_entry = get_role_menu_role(role_entry_id)
+    category = get_role_menu_category(category_id)
+    if role_entry is None or category is None:
+        await interaction.response.send_message("Ce rôle n'est plus configuré.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    discord_role = guild.get_role(role_entry["discord_role_id"])
+    if discord_role is None:
+        await interaction.response.send_message(
+            "Le rôle Discord associé n'existe plus, préviens un admin.", ephemeral=True
+        )
+        return
+
+    member = interaction.user
+    has_it = discord_role in member.roles
+
+    try:
+        if has_it:
+            await member.remove_roles(discord_role, reason="Retiré via le menu de rôles")
+            remove_role_assignment(role_entry_id, member.id)
+        else:
+            # Dans une catégorie exclusive, un seul rôle peut être actif à la fois :
+            # on retire d'abord les autres rôles déjà équipés dans cette catégorie.
+            if category["exclusive"]:
+                for other in get_role_menu_roles(category_id):
+                    if other["id"] == role_entry_id:
+                        continue
+                    other_role = guild.get_role(other["discord_role_id"])
+                    if other_role and other_role in member.roles:
+                        await member.remove_roles(other_role, reason="Choix exclusif dans le menu de rôles")
+                        remove_role_assignment(other["id"], member.id)
+
+            await member.add_roles(discord_role, reason="Ajouté via le menu de rôles")
+            add_role_assignment(role_entry_id, member.id)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "Je n'ai pas la permission de gérer ce rôle. Vérifie que mon propre rôle est bien "
+            "placé au-dessus dans la hiérarchie des rôles du serveur.",
+            ephemeral=True,
+        )
+        return
+
+    # On redessine le panneau de la catégorie avec les nouveaux états.
+    await show_role_category(interaction, menu_id, category_id)
+
+
+class RoleMenuCategorySelect(discord.ui.Select):
+    def __init__(self, menu_id: int, categories: list[dict]):
+        options = [
+            discord.SelectOption(label=c["label"][:100], value=str(c["id"]), emoji=c["emoji"] or None)
+            for c in categories
+        ]
+        super().__init__(placeholder="Choisis une catégorie...", options=options)
+        self.menu_id = menu_id
+
+    async def callback(self, interaction: discord.Interaction):
+        await show_role_category(interaction, self.menu_id, int(self.values[0]))
+
+
+class RoleMenuCategoryView(discord.ui.View):
+    def __init__(self, menu_id: int, categories: list[dict]):
+        super().__init__(timeout=300)
+        self.add_item(RoleMenuCategorySelect(menu_id, categories))
+
+
+class RoleToggleButton(discord.ui.Button):
+    def __init__(self, menu_id: int, category_id: int, role_entry: dict, owned: bool):
+        super().__init__(
+            label=role_entry["label"][:80],
+            emoji=role_entry["emoji"] or None,
+            style=discord.ButtonStyle.success if owned else discord.ButtonStyle.secondary,
+        )
+        self.menu_id = menu_id
+        self.category_id = category_id
+        self.role_entry_id = role_entry["id"]
+
+    async def callback(self, interaction: discord.Interaction):
+        await handle_role_toggle(interaction, self.menu_id, self.category_id, self.role_entry_id)
+
+
+class RoleMenuBackButton(discord.ui.Button):
+    def __init__(self, menu_id: int):
+        super().__init__(label="◀ Retour aux catégories", style=discord.ButtonStyle.secondary, row=4)
+        self.menu_id = menu_id
+
+    async def callback(self, interaction: discord.Interaction):
+        await show_rolemenu_home(interaction, self.menu_id)
+
+
+class RoleMenuRoleView(discord.ui.View):
+    def __init__(self, menu_id: int, category_id: int, roles: list[dict], member: discord.Member):
+        super().__init__(timeout=300)
+        owned_ids = {r.id for r in member.roles}
+        for role_entry in roles:
+            owned = role_entry["discord_role_id"] in owned_ids
+            self.add_item(RoleToggleButton(menu_id, category_id, role_entry, owned))
+        self.add_item(RoleMenuBackButton(menu_id))
+
+
+class RoleMenuOpenView(discord.ui.View):
+    """Vue persistante (timeout=None) attachée au message public d'un menu de rôles.
+    Réenregistrée à chaque démarrage du bot pour tous les menus déjà publiés."""
+
+    def __init__(self, menu_id: int):
+        super().__init__(timeout=None)
+        button = discord.ui.Button(
+            label="Ouvrir mon inventaire", emoji="🎯", style=discord.ButtonStyle.primary,
+            custom_id=f"rolemenu_open:{menu_id}",
+        )
+        button.callback = self.open_callback
+        self.add_item(button)
+        self.menu_id = menu_id
+
+    async def open_callback(self, interaction: discord.Interaction):
+        await show_rolemenu_home(interaction, self.menu_id, first_open=True)
+
+
+role_menu_group = app_commands.Group(
+    name="rolemenu", description="Configurer des menus de sélection de rôles interactifs"
+)
+
+
+async def rolemenu_autocomplete(interaction: discord.Interaction, current: str):
+    if interaction.guild_id is None:
+        return []
+    choices = []
+    for m in get_role_menus(interaction.guild_id):
+        if current.lower() in m["name"].lower():
+            choices.append(app_commands.Choice(name=m["name"][:100], value=m["id"]))
+    return choices[:25]
+
+
+async def rolemenu_category_autocomplete(interaction: discord.Interaction, current: str):
+    if interaction.guild_id is None:
+        return []
+    choices = []
+    for c in get_role_menu_categories_for_guild(interaction.guild_id):
+        label = f"{c['label']} (menu #{c['menu_id']})"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=c["id"]))
+    return choices[:25]
+
+
+@role_menu_group.command(name="creer", description="Créer un nouveau menu de sélection de rôles")
+@app_commands.describe(nom="Nom du menu (affiché en titre)")
+async def rolemenu_creer(interaction: discord.Interaction, nom: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "Il te faut la permission \"Gérer les rôles\" pour configurer un menu.", ephemeral=True
+        )
+        return
+
+    menu_id = create_role_menu(interaction.guild_id, nom, interaction.user.id)
+    await interaction.response.send_message(
+        f"Menu **{nom}** créé (id `{menu_id}`). Ajoute des catégories avec `/rolemenu categorie-ajouter`.",
+        ephemeral=True,
+    )
+
+
+@role_menu_group.command(name="categorie-ajouter", description="Ajouter une catégorie à un menu de rôles")
+@app_commands.describe(
+    menu="Le menu auquel ajouter la catégorie",
+    nom="Nom de la catégorie",
+    exclusif="Un seul rôle actif à la fois dans cette catégorie (ex: langue) ?",
+    emoji="Emoji affiché pour cette catégorie (optionnel)",
+)
+@app_commands.autocomplete(menu=rolemenu_autocomplete)
+async def rolemenu_categorie_ajouter(
+    interaction: discord.Interaction, menu: int, nom: str, exclusif: bool, emoji: str = None
+):
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "Il te faut la permission \"Gérer les rôles\" pour configurer un menu.", ephemeral=True
+        )
+        return
+
+    menu_row = get_role_menu(menu)
+    if menu_row is None or menu_row["guild_id"] != interaction.guild_id:
+        await interaction.response.send_message("Menu introuvable.", ephemeral=True)
+        return
+
+    category_id = add_role_menu_category(menu, nom, emoji, exclusif)
+    await interaction.response.send_message(
+        f"Catégorie **{nom}** ajoutée (id `{category_id}`). Ajoute des rôles avec `/rolemenu role-ajouter`.",
+        ephemeral=True,
+    )
+
+
+@role_menu_group.command(name="role-ajouter", description="Ajouter un rôle Discord à une catégorie d'un menu")
+@app_commands.describe(
+    categorie="La catégorie à laquelle ajouter ce rôle",
+    role="Le rôle Discord à distribuer",
+    emoji="Emoji affiché pour ce rôle (optionnel)",
+    description="Courte description affichée à côté du rôle (optionnel)",
+)
+@app_commands.autocomplete(categorie=rolemenu_category_autocomplete)
+async def rolemenu_role_ajouter(
+    interaction: discord.Interaction,
+    categorie: int,
+    role: discord.Role,
+    emoji: str = None,
+    description: str = None,
+):
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "Il te faut la permission \"Gérer les rôles\" pour configurer un menu.", ephemeral=True
+        )
+        return
+
+    category_row = get_role_menu_category(categorie)
+    if category_row is None:
+        await interaction.response.send_message("Catégorie introuvable.", ephemeral=True)
+        return
+
+    warning = ""
+    if role >= interaction.guild.me.top_role:
+        warning = (
+            "\n⚠️ Ce rôle est placé au-dessus (ou au même niveau que) mon propre rôle dans la "
+            "hiérarchie du serveur : je ne pourrai pas l'attribuer tant que ce ne sera pas corrigé "
+            "(Paramètres du serveur → Rôles, fais glisser mon rôle au-dessus)."
+        )
+
+    role_entry_id = add_role_menu_role(categorie, role.id, role.name, emoji, description)
+    await interaction.response.send_message(
+        f"Rôle **{role.name}** ajouté à la catégorie (id `{role_entry_id}`).{warning}", ephemeral=True
+    )
+
+
+@role_menu_group.command(name="apercu", description="Aperçu de la structure d'un menu avant publication")
+@app_commands.describe(menu="Le menu à prévisualiser")
+@app_commands.autocomplete(menu=rolemenu_autocomplete)
+async def rolemenu_apercu(interaction: discord.Interaction, menu: int):
+    menu_row = get_role_menu(menu)
+    if menu_row is None or menu_row["guild_id"] != interaction.guild_id:
+        await interaction.response.send_message("Menu introuvable.", ephemeral=True)
+        return
+
+    categories = get_role_menu_categories(menu)
+    if not categories:
+        await interaction.response.send_message(
+            f"Le menu **{menu_row['name']}** n'a encore aucune catégorie.", ephemeral=True
+        )
+        return
+
+    lines = []
+    for c in categories:
+        mode = "exclusif" if c["exclusive"] else "multiple"
+        lines.append(f"\n**{(c['emoji'] + ' ') if c['emoji'] else ''}{c['label']}** ({mode})")
+        roles = get_role_menu_roles(c["id"])
+        if not roles:
+            lines.append("　_Aucun rôle configuré._")
+        for r in roles:
+            desc = f" — {r['description']}" if r["description"] else ""
+            lines.append(f"　{(r['emoji'] + ' ') if r['emoji'] else ''}{r['label']}{desc}")
+
+    embed = discord.Embed(title=f"Aperçu — {menu_row['name']}", description="\n".join(lines), color=EMBED_COLOR)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@role_menu_group.command(name="publier", description="Publier le menu de rôles dans ce salon")
+@app_commands.describe(menu="Le menu à publier")
+@app_commands.autocomplete(menu=rolemenu_autocomplete)
+async def rolemenu_publier(interaction: discord.Interaction, menu: int):
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "Il te faut la permission \"Gérer les rôles\" pour publier un menu.", ephemeral=True
+        )
+        return
+
+    menu_row = get_role_menu(menu)
+    if menu_row is None or menu_row["guild_id"] != interaction.guild_id:
+        await interaction.response.send_message("Menu introuvable.", ephemeral=True)
+        return
+
+    categories = get_role_menu_categories(menu)
+    if not categories:
+        await interaction.response.send_message("Ajoute au moins une catégorie avant de publier ce menu.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"🎯 {menu_row['name']}",
+        description=(
+            "Clique sur le bouton ci-dessous pour ouvrir ton inventaire de rôles personnel.\n"
+            "Personne d'autre ne verra ton panneau — choisis librement !"
+        ),
+        color=EMBED_COLOR,
+    )
+    view = RoleMenuOpenView(menu)
+    message = await interaction.channel.send(embed=embed, view=view)
+    set_role_menu_message(menu, interaction.channel.id, message.id)
+
+    await interaction.response.send_message("Menu publié ✅", ephemeral=True)
+
+
 bot.tree.add_command(profil_group)
 bot.tree.add_command(event_group)
+bot.tree.add_command(role_menu_group)
 
 
 if __name__ == "__main__":
