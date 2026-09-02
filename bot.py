@@ -684,6 +684,46 @@ _webserver_started = False
 _persistent_views_registered = False
 
 
+# ---------------------------------------------------------------------------
+# Gestion d'erreurs globale
+# ---------------------------------------------------------------------------
+# Sans ça, une exception survenant APRÈS un interaction.response.defer() (ex:
+# la base Postgres qui échoue, un bug quelconque) ne serait jamais rattrapée :
+# l'interaction resterait bloquée indéfiniment sur "... réfléchit" côté
+# utilisateur, sans aucun message d'erreur ni sur Discord ni dans les logs.
+
+async def _report_interaction_error(interaction: discord.Interaction, error: Exception):
+    import traceback
+    print(f"Erreur lors du traitement d'une interaction ({interaction.command}) :")
+    traceback.print_exception(type(error), error, error.__traceback__)
+
+    message = "⚠️ Une erreur inattendue est survenue. Réessaie, ou préviens un admin si ça persiste."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+class SafeView(discord.ui.View):
+    """Vue de base qui rattrape systématiquement les erreurs de ses boutons/menus,
+    pour ne jamais laisser une interaction bloquée sur "... réfléchit" en cas de bug."""
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        await _report_interaction_error(interaction, error)
+
+
+class SafeModal(discord.ui.Modal):
+    """Modal de base qui rattrape systématiquement les erreurs de soumission,
+    pour ne jamais laisser une interaction bloquée en cas de bug."""
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await _report_interaction_error(interaction, error)
+
+
+
 async def _health_handler(request: web.Request) -> web.Response:
     return web.Response(text="Le bot Discord de profil est en ligne.")
 
@@ -1089,7 +1129,7 @@ async def handle_event_leave(interaction: discord.Interaction, event_id: int):
     await refresh_event_announcement(interaction.client, event_id)
 
 
-class EventView(discord.ui.View):
+class EventView(SafeView):
     """Vue persistante (timeout=None) attachée à un événement précis, via des
     custom_id encodant l'event_id. Réenregistrée à chaque démarrage du bot pour
     que les boutons restent fonctionnels après un redéploiement."""
@@ -1307,7 +1347,7 @@ async def before_event_cleanup_task():
 # Composants d'interface : menu déroulant, formulaires (modals), boutons
 # ---------------------------------------------------------------------------
 
-class BioModal(discord.ui.Modal, title="Modifier ma bio"):
+class BioModal(SafeModal, title="Modifier ma bio"):
     bio_input = discord.ui.TextInput(
         label="Ta bio",
         style=discord.TextStyle.paragraph,
@@ -1339,7 +1379,7 @@ def is_valid_day_month(day: int, month: int) -> bool:
     return 1 <= day <= days_in_month[month - 1]
 
 
-class BirthdayModal(discord.ui.Modal, title="Mon anniversaire"):
+class BirthdayModal(SafeModal, title="Mon anniversaire"):
     date_input = discord.ui.TextInput(
         label="Date (JJ/MM)",
         placeholder="ex: 25/12",
@@ -1382,7 +1422,7 @@ class BirthdayModal(discord.ui.Modal, title="Mon anniversaire"):
         )
 
 
-class LinkServiceModal(discord.ui.Modal):
+class LinkServiceModal(SafeModal):
     pseudo_input = discord.ui.TextInput(
         label="Pseudo ou URL",
         max_length=200,
@@ -1427,7 +1467,7 @@ class LinkServiceSelect(discord.ui.Select):
         await interaction.response.send_modal(LinkServiceModal(self.guild_id, self.user_id, service_key))
 
 
-class LinkServiceSelectView(discord.ui.View):
+class LinkServiceSelectView(SafeView):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(timeout=60)
         self.add_item(LinkServiceSelect(guild_id, user_id))
@@ -1450,13 +1490,13 @@ class LinkRemoveSelect(discord.ui.Select):
         await interaction.edit_original_response(content=f"Lien **{label}** supprimé ✅", view=None)
 
 
-class LinkRemoveView(discord.ui.View):
+class LinkRemoveView(SafeView):
     def __init__(self, guild_id: int, user_id: int, links: list[tuple[str, str]]):
         super().__init__(timeout=60)
         self.add_item(LinkRemoveSelect(guild_id, user_id, links))
 
 
-class ConfirmDeleteView(discord.ui.View):
+class ConfirmDeleteView(SafeView):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(timeout=30)
         self.guild_id = guild_id
@@ -1535,7 +1575,7 @@ class ColorSelect(discord.ui.Select):
         await interaction.edit_original_response(content="Couleur de ton profil mise à jour ✅", view=None)
 
 
-class ColorSelectView(discord.ui.View):
+class ColorSelectView(SafeView):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(timeout=60)
         self.add_item(ColorSelect(guild_id, user_id))
@@ -1624,7 +1664,7 @@ class ProfileEditSelect(discord.ui.Select):
             )
 
 
-class ProfileEditView(discord.ui.View):
+class ProfileEditView(SafeView):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(timeout=180)
         self.add_item(ProfileEditSelect(guild_id, user_id))
@@ -1746,7 +1786,7 @@ def build_connect4_embed(game: Connect4Game) -> discord.Embed:
     return embed
 
 
-class Connect4View(discord.ui.View):
+class Connect4View(SafeView):
     def __init__(self, game: Connect4Game):
         super().__init__(timeout=600)  # partie abandonnée après 10 min d'inactivité
         self.game = game
@@ -1978,7 +2018,7 @@ class RoleMenuCategorySelect(discord.ui.Select):
         await show_role_category(interaction, self.menu_id, int(self.values[0]))
 
 
-class RoleMenuCategoryView(discord.ui.View):
+class RoleMenuCategoryView(SafeView):
     def __init__(self, menu_id: int, categories: list[dict]):
         super().__init__(timeout=300)
         self.add_item(RoleMenuCategorySelect(menu_id, categories))
@@ -2010,7 +2050,7 @@ class RoleMenuBackButton(discord.ui.Button):
         await show_rolemenu_home(interaction, self.menu_id)
 
 
-class RoleMenuRoleView(discord.ui.View):
+class RoleMenuRoleView(SafeView):
     def __init__(self, menu_id: int, category_id: int, roles: list[dict], member: discord.Member):
         super().__init__(timeout=300)
         owned_ids = {r.id for r in member.roles}
@@ -2020,7 +2060,7 @@ class RoleMenuRoleView(discord.ui.View):
         self.add_item(RoleMenuBackButton(menu_id))
 
 
-class RoleMenuOpenView(discord.ui.View):
+class RoleMenuOpenView(SafeView):
     """Vue persistante (timeout=None) attachée au message public d'un menu de rôles.
     Réenregistrée à chaque démarrage du bot pour tous les menus déjà publiés."""
 
@@ -2237,6 +2277,14 @@ async def rolemenu_publier(interaction: discord.Interaction, menu: int):
 bot.tree.add_command(profil_group)
 bot.tree.add_command(event_group)
 bot.tree.add_command(role_menu_group)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Filet de sécurité final pour toutes les commandes slash (/profil, /event,
+    # /rolemenu, /puissance4) : si une exception survient après un defer(), elle
+    # est rattrapée ici plutôt que de laisser l'interaction bloquée indéfiniment.
+    await _report_interaction_error(interaction, error)
 
 
 if __name__ == "__main__":
