@@ -827,12 +827,13 @@ profil_group = app_commands.Group(name="profil", description="Gère ton profil s
 # Suivi en mémoire des sessions vocales en cours : {(guild_id, user_id): timestamp_de_connexion}
 voice_sessions: dict[tuple[int, int], float] = {}
 
-# Messages de bienvenue en attente d'une réaction pour déclencher l'envoi du
-# sticker : {message_id: {"guild_id": int, "channel_id": int, "member_mention": str}}
-# Une entrée est retirée dès que le sticker a été envoyé (déclenchement unique),
-# donc perdre ce dict au redémarrage du bot n'est pas grave : au pire, les
-# messages de bienvenue postés juste avant un redémarrage ne déclenchent plus rien.
-pending_welcome_reactions: dict[int, dict] = {}
+# Messages de bienvenue en attente d'un clic sur le bouton pour déclencher
+# l'envoi du sticker : {message_id: {"guild_id": int, "channel_id": int, "member_mention": str}}
+# Une entrée est retirée dès que le sticker a été envoyé (déclenchement unique).
+# Perdre ce dict au redémarrage du bot n'est pas grave pour les données (le
+# bouton lui-même reste fonctionnel grâce à bot.add_view() dans on_ready),
+# mais un clic pendant cette fenêtre affichera juste "bouton déjà utilisé".
+pending_welcome_buttons: dict[int, dict] = {}
 
 # Empêche de démarrer plusieurs fois le serveur web si on_ready se déclenche
 # plusieurs fois (reconnexions Discord).
@@ -1004,6 +1005,7 @@ async def on_ready():
             bot.add_view(EventView(event["id"]))
         for menu in get_all_published_role_menus():
             bot.add_view(RoleMenuOpenView(menu["id"]))
+        bot.add_view(WelcomeStickerView())
 
     # Si le bot redémarre pendant que des membres sont déjà en vocal,
     # on démarre leur chrono maintenant pour ne pas perdre le suivi.
@@ -1023,6 +1025,57 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+class WelcomeStickerView(discord.ui.View):
+    """Bouton "Bienvenue fami" attaché au message de bienvenue. Persistant
+    (timeout=None + custom_id fixe) pour continuer à fonctionner même après
+    un redémarrage du bot, tant qu'il est ré-enregistré via bot.add_view()
+    dans on_ready."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="🎉 Bienvenue fami",
+        style=discord.ButtonStyle.success,
+        custom_id="welcome_sticker_button",
+    )
+    async def welcome_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # On retire l'entrée immédiatement (avant tout await) pour garantir un
+        # déclenchement unique même si plusieurs personnes cliquent en même temps.
+        entry = pending_welcome_buttons.pop(interaction.message.id, None)
+        if entry is None:
+            await interaction.response.send_message(
+                "Ce bouton a déjà été utilisé.", ephemeral=True
+            )
+            return
+
+        # On désactive le bouton sur le message d'origine pour que personne
+        # d'autre ne puisse re-cliquer dessus.
+        button.disabled = True
+        button.label = "🎉 Bienvenue envoyée !"
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            pass
+
+        configured_stickers = get_welcome_stickers(entry["guild_id"])
+        if not configured_stickers:
+            return
+        choice = random.choice(configured_stickers)
+        sticker = discord.utils.get(interaction.guild.stickers, id=choice["sticker_id"])
+        if sticker is None:
+            return
+
+        channel = interaction.guild.get_channel(entry["channel_id"])
+        if channel is None:
+            return
+
+        try:
+            await channel.send(content=entry["member_mention"], stickers=[sticker])
+        except discord.Forbidden:
+            pass
+
+
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.bot:
@@ -1039,59 +1092,22 @@ async def on_member_join(member: discord.Member):
     template = config.get("message_template") or DEFAULT_WELCOME_TEMPLATE
     content = template.replace("{membre}", member.mention).replace("{serveur}", member.guild.name)
 
+    # Le bouton (et donc le sticker) n'a d'intérêt que s'il y a des stickers
+    # configurés pour ce serveur ; sinon on envoie juste le message texte.
+    has_stickers = bool(get_welcome_stickers(member.guild.id))
+    view = WelcomeStickerView() if has_stickers else None
+
     try:
-        welcome_message = await channel.send(content=content)
+        welcome_message = await channel.send(content=content, view=view)
     except discord.Forbidden:
         return
 
-    # Le sticker n'est plus collé au message de bienvenue : il n'apparaît que
-    # lorsque quelqu'un réagit à ce message (voir on_raw_reaction_add), et une
-    # seule fois (première réaction = déclenchement, les suivantes sont ignorées).
-    if get_welcome_stickers(member.guild.id):
-        pending_welcome_reactions[welcome_message.id] = {
+    if has_stickers:
+        pending_welcome_buttons[welcome_message.id] = {
             "guild_id": member.guild.id,
             "channel_id": channel.id,
             "member_mention": member.mention,
         }
-
-
-@bot.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    entry = pending_welcome_reactions.get(payload.message_id)
-    if entry is None:
-        return
-    if payload.guild_id != entry["guild_id"]:
-        return
-
-    guild = bot.get_guild(payload.guild_id)
-    if guild is None:
-        return
-    reactor = payload.member or guild.get_member(payload.user_id)
-    # Ignore les réactions des bots (dont ce bot lui-même, s'il réagit un jour
-    # à ses propres messages) pour ne pas déclencher le tirage tout seul.
-    if reactor is None or reactor.bot:
-        return
-
-    # On retire l'entrée immédiatement (avant tout await) pour garantir un
-    # déclenchement unique même si plusieurs réactions arrivent en même temps.
-    del pending_welcome_reactions[payload.message_id]
-
-    configured_stickers = get_welcome_stickers(guild.id)
-    if not configured_stickers:
-        return
-    choice = random.choice(configured_stickers)
-    sticker = discord.utils.get(guild.stickers, id=choice["sticker_id"])
-    if sticker is None:
-        return
-
-    channel = guild.get_channel(entry["channel_id"])
-    if channel is None:
-        return
-
-    try:
-        await channel.send(content=entry["member_mention"], stickers=[sticker])
-    except discord.Forbidden:
-        pass
 
 
 @bot.event
