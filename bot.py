@@ -1036,7 +1036,7 @@ async def on_member_join(member: discord.Member):
     configured_stickers = get_welcome_stickers(member.guild.id)
     if configured_stickers:
         choice = random.choice(configured_stickers)
-        sticker = member.guild.get_sticker(choice["sticker_id"])
+        sticker = discord.utils.get(member.guild.stickers, id=choice["sticker_id"])
         if sticker is not None:
             stickers_to_send.append(sticker)
 
@@ -2564,7 +2564,7 @@ async def bienvenue_sticker_ajouter(interaction: discord.Interaction, sticker: s
 
     await interaction.response.defer(ephemeral=True)
 
-    guild_sticker = interaction.guild.get_sticker(int(sticker))
+    guild_sticker = discord.utils.get(interaction.guild.stickers, id=int(sticker))
     if guild_sticker is None:
         await interaction.followup.send(
             "Autocollant introuvable. Choisis-en un dans la liste proposée par l'autocomplétion.",
