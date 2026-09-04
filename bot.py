@@ -35,6 +35,7 @@ chaque serveur a ses propres profils.
 import os
 import re
 import time
+import random
 import asyncio
 import unicodedata
 from contextlib import contextmanager
@@ -327,6 +328,26 @@ def init_db():
             """
         )
 
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS welcome_config (
+                guild_id BIGINT PRIMARY KEY,
+                channel_id BIGINT,
+                message_template TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS welcome_stickers (
+                guild_id BIGINT NOT NULL,
+                sticker_id BIGINT NOT NULL,
+                sticker_name TEXT NOT NULL,
+                PRIMARY KEY (guild_id, sticker_id)
+            )
+            """
+        )
+
 
 def get_or_create_profile(guild_id: int, user_id: int):
     with get_db() as db, db.cursor() as cur:
@@ -502,6 +523,68 @@ def get_participant_count(event_id: int) -> int:
 def close_event(event_id: int, new_status: str = "completed"):
     with get_db() as db, db.cursor() as cur:
         cur.execute("UPDATE events SET status = %s WHERE id = %s", (new_status, event_id))
+
+
+# ---------------------------------------------------------------------------
+# Base de données : message de bienvenue personnalisé + autocollants choisis
+# ---------------------------------------------------------------------------
+
+DEFAULT_WELCOME_TEMPLATE = "Bienvenue {membre} sur **{serveur}** ! 🎉"
+
+
+def get_welcome_config(guild_id: int) -> dict | None:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM welcome_config WHERE guild_id = %s", (guild_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def set_welcome_channel(guild_id: int, channel_id: int | None):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO welcome_config (guild_id, channel_id) VALUES (%s, %s)
+            ON CONFLICT (guild_id) DO UPDATE SET channel_id = EXCLUDED.channel_id
+            """,
+            (guild_id, channel_id),
+        )
+
+
+def set_welcome_message(guild_id: int, template: str):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO welcome_config (guild_id, message_template) VALUES (%s, %s)
+            ON CONFLICT (guild_id) DO UPDATE SET message_template = EXCLUDED.message_template
+            """,
+            (guild_id, template),
+        )
+
+
+def add_welcome_sticker(guild_id: int, sticker_id: int, sticker_name: str):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO welcome_stickers (guild_id, sticker_id, sticker_name) VALUES (%s, %s, %s) "
+            "ON CONFLICT (guild_id, sticker_id) DO NOTHING",
+            (guild_id, sticker_id, sticker_name),
+        )
+
+
+def remove_welcome_sticker(guild_id: int, sticker_id: int) -> bool:
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM welcome_stickers WHERE guild_id = %s AND sticker_id = %s",
+            (guild_id, sticker_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_welcome_stickers(guild_id: int) -> list[dict]:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM welcome_stickers WHERE guild_id = %s ORDER BY sticker_name", (guild_id,)
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +815,11 @@ def delete_profile(guild_id: int, user_id: int):
 # ---------------------------------------------------------------------------
 
 intents = discord.Intents.default()
+# Intent privilégié nécessaire pour détecter l'arrivée de nouveaux membres
+# (système de bienvenue). Doit AUSSI être activé sur le portail développeur
+# Discord (onglet Bot → Server Members Intent), sinon on_member_join ne se
+# déclenche jamais, silencieusement.
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 profil_group = app_commands.Group(name="profil", description="Gère ton profil sur ce serveur")
@@ -926,6 +1014,36 @@ async def on_message(message: discord.Message):
     if message.guild is not None and not message.author.bot:
         increment_message_count(message.guild.id, message.author.id)
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.bot:
+        return
+
+    config = get_welcome_config(member.guild.id)
+    if config is None or not config.get("channel_id"):
+        return  # Système de bienvenue non configuré sur ce serveur
+
+    channel = member.guild.get_channel(config["channel_id"])
+    if channel is None:
+        return
+
+    template = config.get("message_template") or DEFAULT_WELCOME_TEMPLATE
+    content = template.replace("{membre}", member.mention).replace("{serveur}", member.guild.name)
+
+    stickers_to_send = []
+    configured_stickers = get_welcome_stickers(member.guild.id)
+    if configured_stickers:
+        choice = random.choice(configured_stickers)
+        sticker = member.guild.get_sticker(choice["sticker_id"])
+        if sticker is not None:
+            stickers_to_send.append(sticker)
+
+    try:
+        await channel.send(content=content, stickers=stickers_to_send)
+    except discord.Forbidden:
+        pass
 
 
 @bot.event
@@ -2356,9 +2474,157 @@ async def rolemenu_publier(interaction: discord.Interaction, menu: int):
     await interaction.followup.send("Menu publié ✅", ephemeral=True)
 
 
+# ---------------------------------------------------------------------------
+# Message de bienvenue personnalisé avec autocollants choisis par l'admin
+# ---------------------------------------------------------------------------
+
+welcome_group = app_commands.Group(
+    name="bienvenue", description="Configurer le message de bienvenue et ses autocollants"
+)
+
+
+async def welcome_sticker_autocomplete(interaction: discord.Interaction, current: str):
+    """Liste les autocollants existants du serveur (pour /bienvenue sticker-ajouter)."""
+    if interaction.guild is None:
+        return []
+    choices = []
+    for sticker in interaction.guild.stickers:
+        if current.lower() in sticker.name.lower():
+            choices.append(app_commands.Choice(name=sticker.name[:100], value=str(sticker.id)))
+    return choices[:25]
+
+
+async def configured_welcome_sticker_autocomplete(interaction: discord.Interaction, current: str):
+    """Liste les autocollants déjà configurés pour la bienvenue (pour /bienvenue sticker-retirer)."""
+    if interaction.guild_id is None:
+        return []
+    choices = []
+    for s in get_welcome_stickers(interaction.guild_id):
+        if current.lower() in s["sticker_name"].lower():
+            choices.append(app_commands.Choice(name=s["sticker_name"][:100], value=str(s["sticker_id"])))
+    return choices[:25]
+
+
+@welcome_group.command(name="salon", description="Définir le salon où poster les messages de bienvenue")
+@app_commands.describe(salon="Le salon textuel à utiliser (laisse vide pour désactiver)")
+async def bienvenue_salon(interaction: discord.Interaction, salon: discord.TextChannel = None):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "Il te faut la permission \"Gérer le serveur\" pour configurer la bienvenue.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    set_welcome_channel(interaction.guild_id, salon.id if salon else None)
+
+    if salon:
+        await interaction.followup.send(f"Les messages de bienvenue seront postés dans {salon.mention} ✅", ephemeral=True)
+    else:
+        await interaction.followup.send("Système de bienvenue désactivé.", ephemeral=True)
+
+
+@welcome_group.command(name="message", description="Personnaliser le texte du message de bienvenue")
+@app_commands.describe(texte="Utilise {membre} pour la mention et {serveur} pour le nom du serveur")
+async def bienvenue_message(interaction: discord.Interaction, texte: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "Il te faut la permission \"Gérer le serveur\" pour configurer la bienvenue.", ephemeral=True
+        )
+        return
+    if "{membre}" not in texte:
+        await interaction.response.send_message(
+            "Ton message doit contenir `{membre}` pour mentionner la personne qui arrive.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    set_welcome_message(interaction.guild_id, texte)
+    exemple = texte.replace("{membre}", interaction.user.mention).replace("{serveur}", interaction.guild.name)
+    await interaction.followup.send(f"Message mis à jour ✅\n\nAperçu : {exemple}", ephemeral=True)
+
+
+@welcome_group.command(name="sticker-ajouter", description="Ajouter un autocollant du serveur au tirage de bienvenue")
+@app_commands.describe(sticker="L'autocollant du serveur à ajouter")
+@app_commands.autocomplete(sticker=welcome_sticker_autocomplete)
+async def bienvenue_sticker_ajouter(interaction: discord.Interaction, sticker: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "Il te faut la permission \"Gérer le serveur\" pour configurer la bienvenue.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild_sticker = interaction.guild.get_sticker(int(sticker))
+    if guild_sticker is None:
+        await interaction.followup.send(
+            "Autocollant introuvable. Choisis-en un dans la liste proposée par l'autocomplétion.",
+            ephemeral=True,
+        )
+        return
+
+    add_welcome_sticker(interaction.guild_id, guild_sticker.id, guild_sticker.name)
+    await interaction.followup.send(
+        f"Autocollant **{guild_sticker.name}** ajouté au tirage de bienvenue ✅", ephemeral=True
+    )
+
+
+@welcome_group.command(name="sticker-retirer", description="Retirer un autocollant du tirage de bienvenue")
+@app_commands.describe(sticker="L'autocollant à retirer du tirage")
+@app_commands.autocomplete(sticker=configured_welcome_sticker_autocomplete)
+async def bienvenue_sticker_retirer(interaction: discord.Interaction, sticker: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "Il te faut la permission \"Gérer le serveur\" pour configurer la bienvenue.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    removed = remove_welcome_sticker(interaction.guild_id, int(sticker))
+    if removed:
+        await interaction.followup.send("Autocollant retiré du tirage de bienvenue ✅", ephemeral=True)
+    else:
+        await interaction.followup.send("Cet autocollant n'était pas dans le tirage.", ephemeral=True)
+
+
+@welcome_group.command(name="apercu", description="Prévisualiser le message de bienvenue actuel")
+async def bienvenue_apercu(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    config = get_welcome_config(interaction.guild_id)
+    channel_id = config.get("channel_id") if config else None
+    template = (config.get("message_template") if config else None) or DEFAULT_WELCOME_TEMPLATE
+    stickers = get_welcome_stickers(interaction.guild_id)
+
+    exemple = template.replace("{membre}", interaction.user.mention).replace("{serveur}", interaction.guild.name)
+    salon_txt = f"<#{channel_id}>" if channel_id else "*non configuré (le système est désactivé)*"
+    stickers_txt = ", ".join(s["sticker_name"] for s in stickers) if stickers else "*aucun configuré*"
+
+    embed = discord.Embed(title="Aperçu du message de bienvenue", description=exemple, color=EMBED_COLOR)
+    embed.add_field(name="Salon", value=salon_txt, inline=False)
+    embed.add_field(name="Autocollants dans le tirage", value=stickers_txt, inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 bot.tree.add_command(profil_group)
 bot.tree.add_command(event_group)
 bot.tree.add_command(role_menu_group)
+bot.tree.add_command(welcome_group)
 
 
 @bot.tree.error
