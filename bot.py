@@ -314,28 +314,7 @@ async def on_member_join(member: discord.Member):
     if member.bot:
         return
 
-    # Si le serveur a un écran de vérification / des règles à accepter (ou un
-    # onboarding équivalent) et que le membre n'a pas encore terminé cette
-    # étape, Discord marque `member.pending = True`. Dans ce cas précis, on
-    # n'envoie PAS le message tout de suite : on attend qu'il passe la
-    # vérification (voir on_member_update ci-dessous), sinon le message de
-    # bienvenue arrive avant que le membre ait vraiment accès au serveur — ou,
-    # selon la configuration du serveur (rôle automatique assigné pendant
-    # l'onboarding), l'événement peut même ne jamais correspondre à un membre
-    # "actif" si on ne fait pas ce suivi.
-    if member.pending:
-        return
-
     await send_welcome_message(member)
-
-
-@bot.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    # Le membre vient de terminer la vérification (accepter les règles, etc.) :
-    # c'est le bon moment pour envoyer le message de bienvenue, puisqu'il n'a
-    # pas été envoyé au moment du join (voir le commentaire dans on_member_join).
-    if before.pending and not after.pending:
-        await send_welcome_message(after)
 
 
 welcome_group = app_commands.Group(
