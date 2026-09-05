@@ -237,7 +237,7 @@ class WelcomeStickerView(discord.ui.View):
 
     @discord.ui.button(
         label="🎉 Bienvenue fami",
-        style=discord.ButtonStyle.success,
+        style=discord.ButtonStyle.primary,
         custom_id="welcome_sticker_button",
     )
     async def welcome_button(self, interaction: discord.Interaction, button: discord.ui.Button):
