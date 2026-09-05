@@ -88,7 +88,8 @@ def init_db():
                 guild_id BIGINT PRIMARY KEY,
                 channel_id BIGINT,
                 message_template TEXT,
-                draftbot_id BIGINT
+                draftbot_id BIGINT,
+                draftbot_channel_id BIGINT
             )
             """
         )
@@ -111,10 +112,13 @@ def init_db():
             )
             """
         )
-        # Si la table existait déjà avant l'ajout de la colonne draftbot_id
-        # (mise à jour du bot), on l'ajoute proprement sans tout recréer.
+        # Si la table existait déjà avant l'ajout de ces colonnes (mise à
+        # jour du bot), on les ajoute proprement sans tout recréer.
         cur.execute(
             "ALTER TABLE welcome_config ADD COLUMN IF NOT EXISTS draftbot_id BIGINT"
+        )
+        cur.execute(
+            "ALTER TABLE welcome_config ADD COLUMN IF NOT EXISTS draftbot_channel_id BIGINT"
         )
 
 
@@ -175,14 +179,16 @@ def set_welcome_message(guild_id: int, template: str):
         )
 
 
-def set_draftbot_id(guild_id: int, bot_id: int | None):
+def set_draftbot(guild_id: int, bot_id: int | None, channel_id: int | None):
     with get_db() as db, db.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO welcome_config (guild_id, draftbot_id) VALUES (%s, %s)
-            ON CONFLICT (guild_id) DO UPDATE SET draftbot_id = EXCLUDED.draftbot_id
+            INSERT INTO welcome_config (guild_id, draftbot_id, draftbot_channel_id) VALUES (%s, %s, %s)
+            ON CONFLICT (guild_id) DO UPDATE SET
+                draftbot_id = EXCLUDED.draftbot_id,
+                draftbot_channel_id = EXCLUDED.draftbot_channel_id
             """,
-            (guild_id, bot_id),
+            (guild_id, bot_id, channel_id),
         )
 
 
@@ -419,8 +425,8 @@ async def on_message(message: discord.Message):
             config is not None
             and config.get("draftbot_id")
             and message.author.id == config["draftbot_id"]
-            and config.get("channel_id")
-            and message.channel.id == config["channel_id"]
+            and config.get("draftbot_channel_id")
+            and message.channel.id == config["draftbot_channel_id"]
         ):
             # `message.mentions` reste disponible même sans l'intent
             # privilégié de contenu des messages (contrairement à
@@ -512,8 +518,15 @@ async def bienvenue_message(interaction: discord.Interaction, texte: str):
     name="draftbot",
     description="Se caler sur les messages de bienvenue d'un autre bot (ex: DraftBot) comme filet de sécurité",
 )
-@app_commands.describe(bot="Le bot dont les messages de bienvenue doivent aussi déclencher le nôtre (laisse vide pour désactiver)")
-async def bienvenue_draftbot(interaction: discord.Interaction, bot: discord.User = None):
+@app_commands.describe(
+    bot="Le bot dont les messages de bienvenue doivent aussi déclencher le nôtre (laisse vide pour désactiver)",
+    salon="Le salon où CE bot poste ses messages de bienvenue (peut être différent de celui réglé avec /bienvenue salon)",
+)
+async def bienvenue_draftbot(
+    interaction: discord.Interaction,
+    bot: discord.User = None,
+    salon: discord.TextChannel = None,
+):
     if interaction.guild is None:
         await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
         return
@@ -528,16 +541,21 @@ async def bienvenue_draftbot(interaction: discord.Interaction, bot: discord.User
             ephemeral=True,
         )
         return
+    if bot is not None and salon is None:
+        await interaction.response.send_message(
+            "Précise aussi dans quel salon ce bot poste ses messages de bienvenue (paramètre `salon`).",
+            ephemeral=True,
+        )
+        return
 
     await interaction.response.defer(ephemeral=True)
-    set_draftbot_id(interaction.guild_id, bot.id if bot else None)
+    set_draftbot(interaction.guild_id, bot.id if bot else None, salon.id if salon else None)
 
     if bot:
         await interaction.followup.send(
-            f"Les messages de bienvenue de **{bot.name}** dans le salon configuré déclencheront aussi le "
+            f"Les messages de bienvenue de **{bot.name}** dans {salon.mention} déclencheront aussi le "
             f"message et le sticker de ce bot ✅\n\n"
-            f"⚠️ Ça ne marche que si {bot.name} poste bien dans le même salon que celui réglé avec "
-            f"`/bienvenue salon`, et qu'il mentionne le nouveau membre dans son message.",
+            f"⚠️ Ça ne marche que si {bot.name} mentionne bien le nouveau membre dans son message.",
             ephemeral=True,
         )
     else:
@@ -606,11 +624,15 @@ async def bienvenue_apercu(interaction: discord.Interaction):
     template = (config.get("message_template") if config else None) or DEFAULT_WELCOME_TEMPLATE
     stickers = get_welcome_stickers(interaction.guild_id)
     draftbot_id = config.get("draftbot_id") if config else None
+    draftbot_channel_id = config.get("draftbot_channel_id") if config else None
 
     exemple = template.replace("{membre}", interaction.user.mention).replace("{serveur}", interaction.guild.name)
     salon_txt = f"<#{channel_id}>" if channel_id else "*non configuré (le système est désactivé)*"
     stickers_txt = ", ".join(s["sticker_name"] for s in stickers) if stickers else "*aucun configuré*"
-    draftbot_txt = f"<@{draftbot_id}>" if draftbot_id else "*aucun (désactivé)*"
+    if draftbot_id and draftbot_channel_id:
+        draftbot_txt = f"<@{draftbot_id}> dans <#{draftbot_channel_id}>"
+    else:
+        draftbot_txt = "*aucun (désactivé)*"
 
     embed = discord.Embed(title="Aperçu du message de bienvenue", description=exemple, color=EMBED_COLOR)
     embed.add_field(name="Salon", value=salon_txt, inline=False)
