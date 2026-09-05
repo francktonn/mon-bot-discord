@@ -280,12 +280,16 @@ class WelcomeStickerView(discord.ui.View):
 
 async def send_welcome_message(member: discord.Member):
     """Poste le message de bienvenue (+ bouton à sticker) pour ce membre."""
+    print(f"[bienvenue] send_welcome_message appelé pour {member} (id={member.id}, pending={member.pending}) sur {member.guild.name}")
+
     config = get_welcome_config(member.guild.id)
     if config is None or not config.get("channel_id"):
+        print(f"[bienvenue] Aucun salon configuré pour {member.guild.name} (config={config}) — abandon.")
         return  # Système de bienvenue non configuré sur ce serveur
 
     channel = member.guild.get_channel(config["channel_id"])
     if channel is None:
+        print(f"[bienvenue] Salon {config['channel_id']} introuvable (supprimé ?) sur {member.guild.name} — abandon.")
         return
 
     template = config.get("message_template") or DEFAULT_WELCOME_TEMPLATE
@@ -298,8 +302,13 @@ async def send_welcome_message(member: discord.Member):
 
     try:
         welcome_message = await channel.send(content=content, view=view)
+        print(f"[bienvenue] Message envoyé avec succès dans #{channel.name} pour {member}.")
     except discord.Forbidden:
+        print(f"[bienvenue] Permission refusée pour envoyer dans #{channel.name} sur {member.guild.name}.")
         return
+    except Exception as e:
+        print(f"[bienvenue] Erreur inattendue lors de l'envoi : {e!r}")
+        raise
 
     if has_stickers:
         pending_welcome_buttons[welcome_message.id] = {
@@ -311,6 +320,7 @@ async def send_welcome_message(member: discord.Member):
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    print(f"[bienvenue] on_member_join déclenché pour {member} (id={member.id}, bot={member.bot}) sur {member.guild.name}")
     if member.bot:
         return
 
