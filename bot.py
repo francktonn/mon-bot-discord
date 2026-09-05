@@ -230,12 +230,14 @@ intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Messages de bienvenue en attente d'un clic sur le bouton pour déclencher
-# l'envoi du sticker : {message_id: {"guild_id": int, "channel_id": int, "member_mention": str}}
-# Une entrée est retirée dès que le sticker a été envoyé (déclenchement unique).
-# Perdre ce dict au redémarrage du bot n'est pas grave pour les données (le
-# bouton lui-même reste fonctionnel grâce à bot.add_view() dans on_ready),
-# mais un clic pendant cette fenêtre affichera juste "bouton déjà utilisé".
+# Messages de bienvenue avec bouton actif : {message_id: {"guild_id": int, "channel_id": int,
+# "member_mention": str, "clicked_by": set[int]}}
+# Le bouton reste actif indéfiniment (il n'est jamais désactivé) : chaque
+# personne du serveur peut l'utiliser, mais une seule fois chacune (son ID est
+# ajouté à "clicked_by" après son premier clic). Perdre ce dict au redémarrage
+# du bot n'est pas grave pour les données (le bouton lui-même reste
+# fonctionnel grâce à bot.add_view() dans on_ready), mais tout le monde pourra
+# alors re-cliquer une fois après un redémarrage.
 pending_welcome_buttons: dict[int, dict] = {}
 
 # Empêche de démarrer plusieurs fois le serveur web ou de ré-enregistrer les
@@ -309,37 +311,41 @@ class WelcomeStickerView(discord.ui.View):
         custom_id="welcome_sticker_button",
     )
     async def welcome_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # On retire l'entrée immédiatement (avant tout await) pour garantir un
-        # déclenchement unique même si plusieurs personnes cliquent en même temps.
-        entry = pending_welcome_buttons.pop(interaction.message.id, None)
+        entry = pending_welcome_buttons.get(interaction.message.id)
         if entry is None:
             await interaction.response.send_message(
-                "Ce bouton a déjà été utilisé.", ephemeral=True
+                "Ce bouton n'est plus actif (le bot a probablement redémarré depuis).", ephemeral=True
             )
             return
 
-        # On désactive le bouton sur le message d'origine pour que personne
-        # d'autre ne puisse re-cliquer dessus.
-        button.disabled = True
-        button.label = "🎉 Bienvenue envoyée !"
-        try:
-            await interaction.response.edit_message(view=self)
-        except discord.HTTPException:
-            pass
+        if interaction.user.id in entry["clicked_by"]:
+            await interaction.response.send_message(
+                "Tu as déjà souhaité la bienvenue ici !", ephemeral=True
+            )
+            return
+
+        # On marque tout de suite ce clic comme traité (avant tout await),
+        # pour qu'un double-clic rapide de la même personne ne déclenche pas
+        # deux envois.
+        entry["clicked_by"].add(interaction.user.id)
 
         configured_stickers = get_welcome_stickers(entry["guild_id"])
         if not configured_stickers:
+            await interaction.response.send_message("Aucun autocollant configuré pour la bienvenue.", ephemeral=True)
             return
         choice = random.choice(configured_stickers)
         sticker = discord.utils.get(interaction.guild.stickers, id=choice["sticker_id"])
         if sticker is None:
+            await interaction.response.send_message("Autocollant introuvable.", ephemeral=True)
             return
 
         channel = interaction.guild.get_channel(entry["channel_id"])
         if channel is None:
+            await interaction.response.send_message("Salon introuvable.", ephemeral=True)
             return
 
         content = f"{interaction.user.mention} te souhaite la bienvenue {entry['member_mention']} !"
+        await interaction.response.defer()
         try:
             await channel.send(content=content, stickers=[sticker])
         except discord.Forbidden:
@@ -392,6 +398,7 @@ async def send_welcome_message(member: discord.Member):
             "guild_id": member.guild.id,
             "channel_id": channel.id,
             "member_mention": member.mention,
+            "clicked_by": set(),
         }
 
 
