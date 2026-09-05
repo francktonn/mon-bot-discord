@@ -87,7 +87,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS welcome_config (
                 guild_id BIGINT PRIMARY KEY,
                 channel_id BIGINT,
-                message_template TEXT
+                message_template TEXT,
+                draftbot_id BIGINT
             )
             """
         )
@@ -109,6 +110,11 @@ def init_db():
                 PRIMARY KEY (guild_id, member_id)
             )
             """
+        )
+        # Si la table existait déjà avant l'ajout de la colonne draftbot_id
+        # (mise à jour du bot), on l'ajoute proprement sans tout recréer.
+        cur.execute(
+            "ALTER TABLE welcome_config ADD COLUMN IF NOT EXISTS draftbot_id BIGINT"
         )
 
 
@@ -140,12 +146,6 @@ def forget_member(guild_id: int, member_id: int):
         )
 
 
-def get_all_known_member_ids(guild_id: int) -> set[int]:
-    with get_db() as db, db.cursor() as cur:
-        cur.execute("SELECT member_id FROM known_members WHERE guild_id = %s", (guild_id,))
-        return {row[0] for row in cur.fetchall()}
-
-
 def get_welcome_config(guild_id: int) -> dict | None:
     with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT * FROM welcome_config WHERE guild_id = %s", (guild_id,))
@@ -172,6 +172,17 @@ def set_welcome_message(guild_id: int, template: str):
             ON CONFLICT (guild_id) DO UPDATE SET message_template = EXCLUDED.message_template
             """,
             (guild_id, template),
+        )
+
+
+def set_draftbot_id(guild_id: int, bot_id: int | None):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO welcome_config (guild_id, draftbot_id) VALUES (%s, %s)
+            ON CONFLICT (guild_id) DO UPDATE SET draftbot_id = EXCLUDED.draftbot_id
+            """,
+            (guild_id, bot_id),
         )
 
 
@@ -225,7 +236,6 @@ pending_welcome_buttons: dict[int, dict] = {}
 # vues persistantes si on_ready se déclenche plusieurs fois (reconnexions Discord).
 _webserver_started = False
 _persistent_views_registered = False
-_sync_loop_started = False
 
 
 # ---------------------------------------------------------------------------
@@ -390,72 +400,41 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    # On oublie ce membre : s'il revient plus tard (leave + rejoin), Discord
-    # devrait redéclencher un vrai événement d'arrivée, et ce sera traité
-    # comme une nouvelle arrivée normale.
+    # On oublie ce membre : s'il revient plus tard (leave + rejoin), ce sera
+    # traité comme une nouvelle arrivée normale (par on_member_join ou par
+    # le message de DraftBot, voir on_message ci-dessous).
     forget_member(member.guild.id, member.id)
 
 
 @bot.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    # Filet de sécurité pour un bug connu de Discord : quand un membre reçoit
-    # automatiquement un rôle synchronisé depuis une intégration (ex :
-    # abonné Twitch) au moment où il rejoint, on_member_join ne se déclenche
-    # parfois jamais (voir https://github.com/Rapptz/discord.py/discussions/10366).
-    # On détecte donc aussi l'arrivée via l'apparition de son tout premier
-    # rôle, tant que ce membre a rejoint très récemment et n'a pas déjà été
-    # accueilli — pour ne pas redéclencher le message à chaque changement de
-    # rôle d'un membre présent depuis longtemps.
-    if after.bot:
-        return
-    if before.roles == after.roles:
-        return
-    if is_known_member(after.guild.id, after.id):
-        return
-    if after.joined_at is None:
-        return
-    if discord.utils.utcnow() - after.joined_at > timedelta(minutes=10):
-        return
+async def on_message(message: discord.Message):
+    # Filet de sécurité pour les arrivées que Discord ne signale jamais à
+    # notre bot (bug connu avec les comptes liés à une intégration comme
+    # Twitch : https://github.com/Rapptz/discord.py/discussions/10366).
+    # DraftBot, lui, arrive à détecter ces arrivées et poste un message de
+    # bienvenue — on se base donc dessus comme second déclencheur.
+    if message.guild is not None and message.author.bot:
+        config = get_welcome_config(message.guild.id)
+        if (
+            config is not None
+            and config.get("draftbot_id")
+            and message.author.id == config["draftbot_id"]
+            and config.get("channel_id")
+            and message.channel.id == config["channel_id"]
+        ):
+            # `message.mentions` reste disponible même sans l'intent
+            # privilégié de contenu des messages (contrairement à
+            # `message.content`) : c'est une liste structurée à part,
+            # fournie par Discord indépendamment du texte.
+            real_mentions = [m for m in message.mentions if not m.bot]
+            if real_mentions:
+                member = real_mentions[0]
+                print(f"[bienvenue] Message de DraftBot détecté, mentionnant {member} sur {message.guild.name}.")
+                await send_welcome_message(member)
 
-    print(f"[bienvenue] on_member_update (rôle changé, arrivée récente) pour {after} sur {after.guild.name} — déclenchement du filet de sécurité.")
-    await send_welcome_message(after)
-
-
-async def welcome_sync_loop():
-    """Filet de sécurité final : pour certains membres (bug Discord/Twitch),
-    AUCUN événement gateway n'arrive jamais, ni join ni changement de rôle.
-    Cette boucle interroge donc directement l'API Discord toutes les 2
-    minutes pour comparer la vraie liste des membres à celle déjà connue, et
-    accueille tout nouveau membre qu'aucun événement n'aurait signalé."""
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        for guild in bot.guilds:
-            config = get_welcome_config(guild.id)
-            if config is None or not config.get("channel_id"):
-                continue
-            try:
-                known_ids = get_all_known_member_ids(guild.id)
-                current_ids = {m.id async for m in guild.fetch_members(limit=None) if not m.bot}
-
-                if not known_ids:
-                    # Premier passage pour ce serveur (table vide) : on ne veut
-                    # surtout pas envoyer un message à tous les membres déjà
-                    # présents d'un coup. On les marque juste comme "connus"
-                    # sans les accueillir, et on ne traitera comme nouveaux que
-                    # les prochaines arrivées.
-                    print(f"[bienvenue] Initialisation de la synchro périodique pour {guild.name} ({len(current_ids)} membres déjà présents, non accueillis).")
-                    for member_id in current_ids:
-                        mark_known_member(guild.id, member_id)
-                    continue
-
-                new_ids = current_ids - known_ids
-                for member_id in new_ids:
-                    member = guild.get_member(member_id) or await guild.fetch_member(member_id)
-                    print(f"[bienvenue] Synchro périodique : {member} découvert sans qu'aucun événement ne se soit déclenché.")
-                    await send_welcome_message(member)
-            except Exception as e:
-                print(f"[bienvenue] Erreur pendant la synchro périodique sur {guild.name} : {e!r}")
-        await asyncio.sleep(120)
+    # Nécessaire puisqu'on surcharge on_message : sans ça, les éventuelles
+    # commandes textuelles ("!...") cesseraient discrètement de fonctionner.
+    await bot.process_commands(message)
 
 
 welcome_group = app_commands.Group(
@@ -529,6 +508,42 @@ async def bienvenue_message(interaction: discord.Interaction, texte: str):
     await interaction.followup.send(f"Message mis à jour ✅\n\nAperçu : {exemple}", ephemeral=True)
 
 
+@welcome_group.command(
+    name="draftbot",
+    description="Se caler sur les messages de bienvenue d'un autre bot (ex: DraftBot) comme filet de sécurité",
+)
+@app_commands.describe(bot="Le bot dont les messages de bienvenue doivent aussi déclencher le nôtre (laisse vide pour désactiver)")
+async def bienvenue_draftbot(interaction: discord.Interaction, bot: discord.User = None):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "Il te faut la permission \"Gérer le serveur\" pour configurer la bienvenue.", ephemeral=True
+        )
+        return
+    if bot is not None and not bot.bot:
+        await interaction.response.send_message(
+            "Ce n'est pas un bot — choisis le compte du bot qui poste les messages de bienvenue (ex: DraftBot).",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    set_draftbot_id(interaction.guild_id, bot.id if bot else None)
+
+    if bot:
+        await interaction.followup.send(
+            f"Les messages de bienvenue de **{bot.name}** dans le salon configuré déclencheront aussi le "
+            f"message et le sticker de ce bot ✅\n\n"
+            f"⚠️ Ça ne marche que si {bot.name} poste bien dans le même salon que celui réglé avec "
+            f"`/bienvenue salon`, et qu'il mentionne le nouveau membre dans son message.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send("Filet de sécurité désactivé.", ephemeral=True)
+
+
 @welcome_group.command(name="sticker-ajouter", description="Ajouter un autocollant du serveur au tirage de bienvenue")
 @app_commands.describe(sticker="L'autocollant du serveur à ajouter")
 @app_commands.autocomplete(sticker=welcome_sticker_autocomplete)
@@ -590,14 +605,17 @@ async def bienvenue_apercu(interaction: discord.Interaction):
     channel_id = config.get("channel_id") if config else None
     template = (config.get("message_template") if config else None) or DEFAULT_WELCOME_TEMPLATE
     stickers = get_welcome_stickers(interaction.guild_id)
+    draftbot_id = config.get("draftbot_id") if config else None
 
     exemple = template.replace("{membre}", interaction.user.mention).replace("{serveur}", interaction.guild.name)
     salon_txt = f"<#{channel_id}>" if channel_id else "*non configuré (le système est désactivé)*"
     stickers_txt = ", ".join(s["sticker_name"] for s in stickers) if stickers else "*aucun configuré*"
+    draftbot_txt = f"<@{draftbot_id}>" if draftbot_id else "*aucun (désactivé)*"
 
     embed = discord.Embed(title="Aperçu du message de bienvenue", description=exemple, color=EMBED_COLOR)
     embed.add_field(name="Salon", value=salon_txt, inline=False)
     embed.add_field(name="Autocollants dans le tirage", value=stickers_txt, inline=False)
+    embed.add_field(name="Filet de sécurité (bot de référence)", value=draftbot_txt, inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -627,11 +645,6 @@ async def on_ready():
     if not _persistent_views_registered:
         _persistent_views_registered = True
         bot.add_view(WelcomeStickerView())
-
-    global _sync_loop_started
-    if not _sync_loop_started:
-        _sync_loop_started = True
-        asyncio.create_task(welcome_sync_loop())
 
 
 @bot.tree.error
