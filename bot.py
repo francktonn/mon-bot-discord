@@ -271,8 +271,9 @@ class WelcomeStickerView(discord.ui.View):
         if channel is None:
             return
 
+        content = f"{interaction.user.mention} te souhaite la bienvenue {entry['member_mention']} !"
         try:
-            await channel.send(content=entry["member_mention"], stickers=[sticker])
+            await channel.send(content=content, stickers=[sticker])
         except discord.Forbidden:
             pass
 
