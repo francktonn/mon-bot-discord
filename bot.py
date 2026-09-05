@@ -22,6 +22,7 @@ redéploiements et redémarrages, même sur les hébergeurs sans disque persista
 """
 
 import os
+import sys
 import random
 import asyncio
 import traceback
@@ -36,6 +37,12 @@ from dotenv import load_dotenv
 from aiohttp import web
 
 load_dotenv()
+
+# Sans ça, les print() peuvent rester bloqués dans un tampon interne quand la
+# sortie standard n'est pas un vrai terminal (c'est le cas sur Render et la
+# plupart des hébergeurs) : le code s'exécute normalement, mais les logs
+# n'apparaissent pas tout de suite (voire pas du tout avant un redémarrage).
+sys.stdout.reconfigure(line_buffering=True)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 # URL de connexion à la base Postgres (fournie par Neon, Supabase, Render Postgres...).
