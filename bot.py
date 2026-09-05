@@ -27,6 +27,7 @@ import random
 import asyncio
 import traceback
 from contextlib import contextmanager
+from datetime import timedelta
 
 import discord
 import psycopg2
@@ -99,6 +100,33 @@ def init_db():
                 PRIMARY KEY (guild_id, sticker_id)
             )
             """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS welcomed_members (
+                guild_id BIGINT NOT NULL,
+                member_id BIGINT NOT NULL,
+                PRIMARY KEY (guild_id, member_id)
+            )
+            """
+        )
+
+
+def has_been_welcomed(guild_id: int, member_id: int) -> bool:
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM welcomed_members WHERE guild_id = %s AND member_id = %s",
+            (guild_id, member_id),
+        )
+        return cur.fetchone() is not None
+
+
+def mark_welcomed(guild_id: int, member_id: int):
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO welcomed_members (guild_id, member_id) VALUES (%s, %s) "
+            "ON CONFLICT (guild_id, member_id) DO NOTHING",
+            (guild_id, member_id),
         )
 
 
@@ -286,7 +314,11 @@ class WelcomeStickerView(discord.ui.View):
 
 
 async def send_welcome_message(member: discord.Member):
-    """Poste le message de bienvenue (+ bouton à sticker) pour ce membre."""
+    """Poste le message de bienvenue (+ bouton à sticker) pour ce membre, une seule fois."""
+    if has_been_welcomed(member.guild.id, member.id):
+        print(f"[bienvenue] {member} a déjà été accueilli sur {member.guild.name} — on ignore.")
+        return
+
     print(f"[bienvenue] send_welcome_message appelé pour {member} (id={member.id}, pending={member.pending}) sur {member.guild.name}")
 
     config = get_welcome_config(member.guild.id)
@@ -306,6 +338,11 @@ async def send_welcome_message(member: discord.Member):
     # configurés pour ce serveur ; sinon on envoie juste le message texte.
     has_stickers = bool(get_welcome_stickers(member.guild.id))
     view = WelcomeStickerView() if has_stickers else None
+
+    # On marque le membre comme accueilli AVANT d'envoyer, pour éviter tout
+    # doublon si on_member_join et le filet de sécurité (on_member_update)
+    # se déclenchaient tous les deux pour la même personne.
+    mark_welcomed(member.guild.id, member.id)
 
     try:
         welcome_message = await channel.send(content=content, view=view)
@@ -327,11 +364,36 @@ async def send_welcome_message(member: discord.Member):
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    print(f"[bienvenue] on_member_join déclenché pour {member} (id={member.id}, bot={member.bot}) sur {member.guild.name}")
+    print(f"[bienvenue] on_member_join déclenché pour {member} (id={member.id}, bot={member.bot}, pending={member.pending}) sur {member.guild.name}")
     if member.bot:
         return
 
     await send_welcome_message(member)
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    # Filet de sécurité pour un bug connu de Discord : quand un membre reçoit
+    # automatiquement un rôle synchronisé depuis une intégration (ex :
+    # abonné Twitch) au moment où il rejoint, on_member_join ne se déclenche
+    # parfois jamais (voir https://github.com/Rapptz/discord.py/discussions/10366).
+    # On détecte donc aussi l'arrivée via l'apparition de son tout premier
+    # rôle, tant que ce membre a rejoint très récemment et n'a pas déjà été
+    # accueilli — pour ne pas redéclencher le message à chaque changement de
+    # rôle d'un membre présent depuis longtemps.
+    if after.bot:
+        return
+    if before.roles == after.roles:
+        return
+    if has_been_welcomed(after.guild.id, after.id):
+        return
+    if after.joined_at is None:
+        return
+    if discord.utils.utcnow() - after.joined_at > timedelta(minutes=10):
+        return
+
+    print(f"[bienvenue] on_member_update (rôle changé, arrivée récente) pour {after} sur {after.guild.name} — déclenchement du filet de sécurité.")
+    await send_welcome_message(after)
 
 
 welcome_group = app_commands.Group(
