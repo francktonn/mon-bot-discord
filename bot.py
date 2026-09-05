@@ -101,33 +101,6 @@ def init_db():
             )
             """
         )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS welcomed_members (
-                guild_id BIGINT NOT NULL,
-                member_id BIGINT NOT NULL,
-                PRIMARY KEY (guild_id, member_id)
-            )
-            """
-        )
-
-
-def has_been_welcomed(guild_id: int, member_id: int) -> bool:
-    with get_db() as db, db.cursor() as cur:
-        cur.execute(
-            "SELECT 1 FROM welcomed_members WHERE guild_id = %s AND member_id = %s",
-            (guild_id, member_id),
-        )
-        return cur.fetchone() is not None
-
-
-def mark_welcomed(guild_id: int, member_id: int):
-    with get_db() as db, db.cursor() as cur:
-        cur.execute(
-            "INSERT INTO welcomed_members (guild_id, member_id) VALUES (%s, %s) "
-            "ON CONFLICT (guild_id, member_id) DO NOTHING",
-            (guild_id, member_id),
-        )
 
 
 def get_welcome_config(guild_id: int) -> dict | None:
@@ -204,6 +177,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # bouton lui-même reste fonctionnel grâce à bot.add_view() dans on_ready),
 # mais un clic pendant cette fenêtre affichera juste "bouton déjà utilisé".
 pending_welcome_buttons: dict[int, dict] = {}
+
+# Suivi en mémoire (pas en base) des membres déjà accueillis pendant que le
+# bot tourne, pour éviter un double message si on_member_join ET le filet de
+# sécurité on_member_update se déclenchaient tous les deux pour la même
+# personne. Remis à zéro à chaque redémarrage/redéploiement — volontaire,
+# pour pouvoir retester facilement en redéployant.
+welcomed_members: set[tuple[int, int]] = set()
 
 # Empêche de démarrer plusieurs fois le serveur web ou de ré-enregistrer les
 # vues persistantes si on_ready se déclenche plusieurs fois (reconnexions Discord).
@@ -315,7 +295,8 @@ class WelcomeStickerView(discord.ui.View):
 
 async def send_welcome_message(member: discord.Member):
     """Poste le message de bienvenue (+ bouton à sticker) pour ce membre, une seule fois."""
-    if has_been_welcomed(member.guild.id, member.id):
+    key = (member.guild.id, member.id)
+    if key in welcomed_members:
         print(f"[bienvenue] {member} a déjà été accueilli sur {member.guild.name} — on ignore.")
         return
 
@@ -342,7 +323,7 @@ async def send_welcome_message(member: discord.Member):
     # On marque le membre comme accueilli AVANT d'envoyer, pour éviter tout
     # doublon si on_member_join et le filet de sécurité (on_member_update)
     # se déclenchaient tous les deux pour la même personne.
-    mark_welcomed(member.guild.id, member.id)
+    welcomed_members.add(key)
 
     try:
         welcome_message = await channel.send(content=content, view=view)
@@ -385,7 +366,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         return
     if before.roles == after.roles:
         return
-    if has_been_welcomed(after.guild.id, after.id):
+    if (after.guild.id, after.id) in welcomed_members:
         return
     if after.joined_at is None:
         return
