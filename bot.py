@@ -22,10 +22,12 @@ redéploiements et redémarrages, même sur les hébergeurs sans disque persista
 """
 
 import os
+import re
 import sys
 import random
 import asyncio
 import traceback
+import unicodedata
 from contextlib import contextmanager
 from datetime import timedelta
 
@@ -674,6 +676,70 @@ async def supprimer_tous_les_salons(interaction: discord.Interaction):
 
     await interaction.followup.send(
         f"✅ Terminé : {deleted} salon(s) supprimé(s), {failed} échec(s).",
+        ephemeral=True,
+    )
+
+
+def _sanitize_channel_name(name: str) -> str:
+    """Convertit un nom fourni en nom de salon Discord valide (Discord refuse
+    certains caractères et met de toute façon tout en minuscules)."""
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    name = name.lower().strip()
+    name = re.sub(r"\s+", "-", name)
+    name = re.sub(r"[^a-z0-9\-_]", "", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    return name[:90] or "salon"
+
+
+@bot.tree.command(name="creer-salons", description="Crée plusieurs salons d'un coup sur le serveur")
+@app_commands.describe(
+    nombre="Le nombre de salons à créer",
+    nom="Le nom de base des salons (par défaut : salon-1, salon-2, ...)",
+    type_salon="Type de salon à créer (texte ou vocal, texte par défaut)",
+)
+@app_commands.choices(
+    type_salon=[
+        app_commands.Choice(name="Texte", value="texte"),
+        app_commands.Choice(name="Vocal", value="vocal"),
+    ]
+)
+async def creer_salons(
+    interaction: discord.Interaction,
+    nombre: int,
+    nom: str = "salon",
+    type_salon: app_commands.Choice[str] = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    base_name = _sanitize_channel_name(nom)
+    is_voice = type_salon is not None and type_salon.value == "vocal"
+
+    created = 0
+    failed = 0
+
+    for i in range(1, nombre + 1):
+        channel_name = f"{base_name}-{i}"
+        try:
+            if is_voice:
+                await interaction.guild.create_voice_channel(
+                    channel_name, reason=f"Création en masse demandée par {interaction.user}"
+                )
+            else:
+                await interaction.guild.create_text_channel(
+                    channel_name, reason=f"Création en masse demandée par {interaction.user}"
+                )
+            created += 1
+        except discord.Forbidden:
+            failed += 1
+        except discord.HTTPException:
+            failed += 1
+
+    await interaction.followup.send(
+        f"✅ Terminé : {created} salon(s) créé(s), {failed} échec(s).",
         ephemeral=True,
     )
 
