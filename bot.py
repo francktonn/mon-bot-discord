@@ -648,6 +648,36 @@ async def bienvenue_apercu(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(
+    name="supprimer-tous-les-salons",
+    description="Supprime immédiatement TOUS les salons du serveur (irréversible)",
+)
+async def supprimer_tous_les_salons(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    channels = list(interaction.guild.channels)
+    deleted = 0
+    failed = 0
+
+    for channel in channels:
+        try:
+            await channel.delete(reason=f"Suppression totale demandée par {interaction.user}")
+            deleted += 1
+        except discord.Forbidden:
+            failed += 1
+        except discord.HTTPException:
+            failed += 1
+
+    await interaction.followup.send(
+        f"✅ Terminé : {deleted} salon(s) supprimé(s), {failed} échec(s).",
+        ephemeral=True,
+    )
+
+
 bot.tree.add_command(welcome_group)
 
 
