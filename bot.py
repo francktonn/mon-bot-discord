@@ -691,11 +691,15 @@ def _sanitize_channel_name(name: str) -> str:
     return name[:90] or "salon"
 
 
+DEFAULT_CHANNEL_MESSAGE = "Bienvenue dans ce salon !"
+
+
 @bot.tree.command(name="creer-salons", description="Crée plusieurs salons d'un coup sur le serveur")
 @app_commands.describe(
     nombre="Le nombre de salons à créer",
     nom="Le nom de base des salons (par défaut : salon-1, salon-2, ...)",
     type_salon="Type de salon à créer (texte ou vocal, texte par défaut)",
+    message="Message posté automatiquement dans chaque salon créé (optionnel)",
 )
 @app_commands.choices(
     type_salon=[
@@ -708,6 +712,7 @@ async def creer_salons(
     nombre: int,
     nom: str = "salon",
     type_salon: app_commands.Choice[str] = None,
+    message: str = DEFAULT_CHANNEL_MESSAGE,
 ):
     if interaction.guild is None:
         await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
@@ -725,14 +730,19 @@ async def creer_salons(
         channel_name = f"{base_name}-{i}"
         try:
             if is_voice:
-                await interaction.guild.create_voice_channel(
+                new_channel = await interaction.guild.create_voice_channel(
                     channel_name, reason=f"Création en masse demandée par {interaction.user}"
                 )
             else:
-                await interaction.guild.create_text_channel(
+                new_channel = await interaction.guild.create_text_channel(
                     channel_name, reason=f"Création en masse demandée par {interaction.user}"
                 )
             created += 1
+            if message:
+                try:
+                    await new_channel.send(message)
+                except discord.HTTPException:
+                    pass  # le salon est créé même si l'envoi du message échoue
         except discord.Forbidden:
             failed += 1
         except discord.HTTPException:
