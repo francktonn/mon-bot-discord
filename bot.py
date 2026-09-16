@@ -22,12 +22,10 @@ redéploiements et redémarrages, même sur les hébergeurs sans disque persista
 """
 
 import os
-import re
 import sys
 import random
 import asyncio
 import traceback
-import unicodedata
 from contextlib import contextmanager
 from datetime import timedelta
 
@@ -648,87 +646,6 @@ async def bienvenue_apercu(interaction: discord.Interaction):
     embed.add_field(name="Autocollants dans le tirage", value=stickers_txt, inline=False)
     embed.add_field(name="Filet de sécurité (bot de référence)", value=draftbot_txt, inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(
-    name="supprimer-tous-les-salons",
-    description="Supprime immédiatement TOUS les salons du serveur (irréversible)",
-)
-async def supprimer_tous_les_salons(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    channels = list(interaction.guild.channels)
-    deleted = 0
-    failed = 0
-
-    for channel in channels:
-        try:
-            await channel.delete(reason=f"Suppression totale demandée par {interaction.user}")
-            deleted += 1
-        except discord.Forbidden:
-            failed += 1
-        except discord.HTTPException:
-            failed += 1
-
-    await interaction.followup.send(
-        f"✅ Terminé : {deleted} salon(s) supprimé(s), {failed} échec(s).",
-        ephemeral=True,
-    )
-
-
-def _sanitize_channel_name(name: str) -> str:
-    """Convertit un nom fourni en nom de salon Discord valide (Discord refuse
-    certains caractères et met de toute façon tout en minuscules)."""
-    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
-    name = name.lower().strip()
-    name = re.sub(r"\s+", "-", name)
-    name = re.sub(r"[^a-z0-9\-_]", "", name)
-    name = re.sub(r"-{2,}", "-", name).strip("-")
-    return name[:90] or "salon"
-
-
-DEFAULT_CHANNEL_MESSAGE = "@everyone test désolé du réveil 🤓"
-DEFAULT_CHANNEL_NAME_BASE = "salon-de-test"
-
-
-@bot.tree.command(name="creer-salons", description="Crée plusieurs salons d'un coup sur le serveur")
-@app_commands.describe(nombre="Le nombre de salons à créer")
-async def creer_salons(interaction: discord.Interaction, nombre: int):
-    if interaction.guild is None:
-        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    base_name = _sanitize_channel_name(DEFAULT_CHANNEL_NAME_BASE)
-
-    created = 0
-    failed = 0
-
-    for i in range(1, nombre + 1):
-        channel_name = f"{base_name}-{i}"
-        try:
-            new_channel = await interaction.guild.create_text_channel(
-                channel_name, reason=f"Création en masse demandée par {interaction.user}"
-            )
-            created += 1
-            try:
-                await new_channel.send(DEFAULT_CHANNEL_MESSAGE)
-            except discord.HTTPException:
-                pass  # le salon est créé même si l'envoi du message échoue
-        except discord.Forbidden:
-            failed += 1
-        except discord.HTTPException:
-            failed += 1
-
-    await interaction.followup.send(
-        f"✅ Terminé : {created} salon(s) créé(s), {failed} échec(s).",
-        ephemeral=True,
-    )
 
 
 bot.tree.add_command(welcome_group)
