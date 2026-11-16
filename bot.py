@@ -352,8 +352,9 @@ def next_cine_slot(now: datetime, schedule: tuple[int, int, int]) -> datetime:
     return now
 
 
-def get_due_cine(guild_ids: list[int], slot_dates: dict[int, object]) -> list[dict]:
-    """Serveurs (parmi guild_ids) avec salon et film définis, pas encore annoncés pour ce créneau."""
+def get_due_cine(guild_ids: list[int]) -> list[dict]:
+    """Serveurs (parmi guild_ids) avec salon et film définis : le film est effacé après
+    chaque annonce, donc il n'y a pas de limite d'annonces par semaine."""
     if not guild_ids:
         return []
     with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -362,8 +363,7 @@ def get_due_cine(guild_ids: list[int], slot_dates: dict[int, object]) -> list[di
             "AND guild_id = ANY(%s)",
             (list(guild_ids),),
         )
-        rows = [dict(r) for r in cur.fetchall()]
-    return [r for r in rows if r.get("last_announced") != slot_dates[r["guild_id"]]]
+        return [dict(r) for r in cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------
@@ -873,6 +873,10 @@ async def send_cine_announcement(cfg: dict) -> bool:
     return True
 
 
+# Envois en échec (serveur, créneau, film), pour ne pas réessayer toutes les minutes.
+_cine_failed: set = set()
+
+
 @tasks.loop(minutes=1)
 async def cine_announce_loop():
     """Vérifie chaque minute si un serveur est dans sa fenêtre d'annonce (jour et heure
@@ -886,10 +890,12 @@ async def cine_announce_loop():
                 slot_dates[gid] = slot
         if not slot_dates:
             return
-        for cfg in await asyncio.to_thread(get_due_cine, list(slot_dates), slot_dates):
-            # Marqué comme annoncé AVANT l'envoi, pour qu'un échec ne boucle pas toutes les minutes.
-            await asyncio.to_thread(set_cine, cfg["guild_id"], last_announced=slot_dates[cfg["guild_id"]])
-            await send_cine_announcement(cfg)
+        for cfg in await asyncio.to_thread(get_due_cine, list(slot_dates)):
+            key = (cfg["guild_id"], slot_dates[cfg["guild_id"]], cfg["film"])
+            if key in _cine_failed:
+                continue  # envoi déjà échoué pour ce film et ce créneau : pas de retry chaque minute
+            if not await send_cine_announcement(cfg):
+                _cine_failed.add(key)
     except Exception:
         traceback.print_exc()
 
@@ -1088,8 +1094,6 @@ async def cine_voir(interaction: discord.Interaction):
         etat.append("⚠️ aucun salon défini")
     if not film:
         etat.append("⚠️ aucun film défini")
-    if cfg.get("last_announced") == prochaine.date():
-        etat.append("⚠️ déjà annoncé pour ce créneau (le prochain sera le suivant)")
     embed.add_field(
         name="Annonce",
         value=(
