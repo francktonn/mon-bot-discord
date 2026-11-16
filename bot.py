@@ -14,8 +14,8 @@ Commandes slash (/) :
     /bienvenue sticker-retirer   -> retire un autocollant du tirage
     /bienvenue apercu            -> prévisualise la configuration actuelle
 
-Annonce du Cinédimanche (chaque dimanche à 12h, heure de Paris) :
-    /cine salon                  -> salon de l'annonce
+Annonce du Cinédimanche (jour et heure au choix, heure de Paris ; dimanche 12h par défaut) :
+    /cine salon                  -> salon de l'annonce + jour et heure (optionnels)
     /cine film                   -> définit le film prévu ce soir
     /cine voir                   -> affiche le film prévu et la configuration
     /cine effacer                -> efface le film prévu
@@ -64,11 +64,15 @@ EMBED_COLOR = 0x5865F2  # blurple
 
 DEFAULT_WELCOME_TEMPLATE = "Bienvenue {membre} sur **{serveur}** ! 🎉"
 
-# Annonce du Cinédimanche : chaque dimanche à 12h (heure de Paris). Si le bot
-# était éteint ou en veille à 12h pile, l'annonce part dès son retour, jusqu'à 18h.
+# Annonce du Cinédimanche : le jour et l'heure se règlent avec /cine salon
+# (heure de Paris). Par défaut : dimanche 12h00. Si le bot était éteint ou en
+# veille à l'heure pile, l'annonce part dès son retour, pendant CINE_WINDOW_HOURS.
 PARIS = ZoneInfo("Europe/Paris")
-CINE_HOUR = 12
-CINE_UNTIL_HOUR = 18
+CINE_DEFAULT_DAY = 6      # 0 = lundi ... 6 = dimanche
+CINE_DEFAULT_HOUR = 12
+CINE_DEFAULT_MINUTE = 0
+CINE_WINDOW_HOURS = 6
+JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")  # facultatif : affiche du film
 # Mot de passe partagé avec la page de la roue : elle l'envoie avec le film choisi
 # au vote (POST /cine). Sans cette variable, l'envoi depuis la page est désactivé.
@@ -158,6 +162,9 @@ def init_db():
             "ALTER TABLE welcome_config ADD COLUMN IF NOT EXISTS draftbot_channel_id BIGINT"
         )
         cur.execute("ALTER TABLE cine_config ADD COLUMN IF NOT EXISTS film_poster TEXT")
+        cur.execute("ALTER TABLE cine_config ADD COLUMN IF NOT EXISTS announce_day INTEGER")
+        cur.execute("ALTER TABLE cine_config ADD COLUMN IF NOT EXISTS announce_hour INTEGER")
+        cur.execute("ALTER TABLE cine_config ADD COLUMN IF NOT EXISTS announce_minute INTEGER")
 
 
 def is_known_member(guild_id: int, member_id: int) -> bool:
@@ -256,7 +263,8 @@ def get_welcome_stickers(guild_id: int) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
-CINE_COLUMNS = {"channel_id", "role_id", "event_time", "film", "film_by", "film_num", "film_poster", "last_announced"}
+CINE_COLUMNS = {"channel_id", "role_id", "event_time", "film", "film_by", "film_num", "film_poster", "last_announced",
+                "announce_day", "announce_hour", "announce_minute"}
 
 
 def get_cine_config(guild_id: int) -> dict | None:
@@ -282,15 +290,70 @@ def set_cine(guild_id: int, **fields):
         )
 
 
-def get_due_cine(today) -> list[dict]:
-    """Serveurs avec un salon et un film définis, pas encore annoncés aujourd'hui."""
+def cine_schedule_of(cfg: dict | None) -> tuple[int, int, int]:
+    """(jour, heure, minute) de l'annonce, avec les valeurs par défaut si non réglé."""
+    cfg = cfg or {}
+    day = cfg.get("announce_day")
+    hour = cfg.get("announce_hour")
+    minute = cfg.get("announce_minute")
+    return (
+        CINE_DEFAULT_DAY if day is None else day,
+        CINE_DEFAULT_HOUR if hour is None else hour,
+        CINE_DEFAULT_MINUTE if minute is None else minute,
+    )
+
+
+def format_cine_schedule(cfg: dict | None) -> str:
+    day, hour, minute = cine_schedule_of(cfg)
+    return f"chaque {JOURS[day]} à {hour}h{minute:02d}"
+
+
+# Planning en mémoire {guild_id: (jour, heure, minute)} pour les serveurs qui ont
+# un salon défini. Il permet à la boucle de ne contacter la base que lorsqu'une
+# annonce est vraiment due (sinon Neon ne pourrait jamais se mettre en veille).
+CINE_SCHEDULES: dict[int, tuple[int, int, int]] = {}
+
+
+def load_cine_schedules():
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM cine_config WHERE channel_id IS NOT NULL")
+        CINE_SCHEDULES.clear()
+        for row in cur.fetchall():
+            CINE_SCHEDULES[row["guild_id"]] = cine_schedule_of(dict(row))
+
+
+def refresh_cine_schedule(guild_id: int):
+    cfg = get_cine_config(guild_id)
+    if cfg and cfg.get("channel_id"):
+        CINE_SCHEDULES[guild_id] = cine_schedule_of(cfg)
+    else:
+        CINE_SCHEDULES.pop(guild_id, None)
+
+
+def current_cine_slot(now: datetime, schedule: tuple[int, int, int]):
+    """Si `now` est dans la fenêtre d'annonce de ce planning, renvoie la date du
+    créneau (utile si la fenêtre passe minuit), sinon None."""
+    day, hour, minute = schedule
+    window = timedelta(hours=CINE_WINDOW_HOURS)
+    for back in (0, 1):
+        slot = (now - timedelta(days=back)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if slot.weekday() == day and slot <= now < slot + window:
+            return slot.date()
+    return None
+
+
+def get_due_cine(guild_ids: list[int], slot_dates: dict[int, object]) -> list[dict]:
+    """Serveurs (parmi guild_ids) avec salon et film définis, pas encore annoncés pour ce créneau."""
+    if not guild_ids:
+        return []
     with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             "SELECT * FROM cine_config WHERE channel_id IS NOT NULL AND film IS NOT NULL "
-            "AND (last_announced IS NULL OR last_announced <> %s)",
-            (today,),
+            "AND guild_id = ANY(%s)",
+            (list(guild_ids),),
         )
-        return [dict(r) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+    return [r for r in rows if r.get("last_announced") != slot_dates[r["guild_id"]]]
 
 
 # ---------------------------------------------------------------------------
@@ -795,22 +858,28 @@ async def send_cine_announcement(cfg: dict) -> bool:
         print(f"[cine] Permission refusée pour envoyer dans #{channel.name}.")
         return False
 
-    set_cine(cfg["guild_id"], film=None, film_by=None, film_num=None, film_poster=None, last_announced=datetime.now(PARIS).date())
+    slot_date = current_cine_slot(datetime.now(PARIS), cine_schedule_of(cfg)) or datetime.now(PARIS).date()
+    set_cine(cfg["guild_id"], film=None, film_by=None, film_num=None, film_poster=None, last_announced=slot_date)
     print(f"[cine] Annonce envoyée dans #{channel.name} : {film}")
     return True
 
 
 @tasks.loop(minutes=1)
 async def cine_announce_loop():
-    """Vérifie chaque minute s'il est temps d'annoncer (dimanche 12h-18h, heure de Paris).
-    En dehors de cette plage, aucune requête n'est faite à la base."""
+    """Vérifie chaque minute si un serveur est dans sa fenêtre d'annonce (jour et heure
+    choisis avec /cine salon, heure de Paris). Hors fenêtre, aucune requête à la base."""
     try:
         now = datetime.now(PARIS)
-        if now.weekday() != 6 or not (CINE_HOUR <= now.hour < CINE_UNTIL_HOUR):
+        slot_dates = {}
+        for gid, schedule in list(CINE_SCHEDULES.items()):
+            slot = current_cine_slot(now, schedule)
+            if slot is not None:
+                slot_dates[gid] = slot
+        if not slot_dates:
             return
-        for cfg in await asyncio.to_thread(get_due_cine, now.date()):
+        for cfg in await asyncio.to_thread(get_due_cine, list(slot_dates), slot_dates):
             # Marqué comme annoncé AVANT l'envoi, pour qu'un échec ne boucle pas toutes les minutes.
-            await asyncio.to_thread(set_cine, cfg["guild_id"], last_announced=now.date())
+            await asyncio.to_thread(set_cine, cfg["guild_id"], last_announced=slot_dates[cfg["guild_id"]])
             await send_cine_announcement(cfg)
     except Exception:
         traceback.print_exc()
@@ -877,7 +946,7 @@ async def _cine_post(request: web.Request) -> web.Response:
     return _reply(200, True)
 
 
-cine_group = app_commands.Group(name="cine", description="Annonce du Cinédimanche (dimanche 12h)")
+cine_group = app_commands.Group(name="cine", description="Annonce du Cinédimanche")
 
 
 async def _require_cine_admin(interaction: discord.Interaction) -> bool:
@@ -892,23 +961,81 @@ async def _require_cine_admin(interaction: discord.Interaction) -> bool:
     return True
 
 
-@cine_group.command(name="salon", description="Définir le salon où le film est annoncé chaque dimanche à 12h")
-@app_commands.describe(salon="Le salon des annonces (laisse vide pour désactiver)")
-async def cine_salon(interaction: discord.Interaction, salon: discord.TextChannel = None):
+def parse_heure(texte: str) -> tuple[int, int] | None:
+    """Accepte 12, 12h, 12h30, 12:30, 8h05... Renvoie (heure, minute) ou None."""
+    m = re.fullmatch(r"\s*(\d{1,2})\s*(?:[h:]\s*(\d{1,2})?)?\s*", texte.lower())
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2) or 0)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+@cine_group.command(name="salon", description="Définir le salon de l'annonce, ainsi que le jour et l'heure")
+@app_commands.describe(
+    salon="Le salon des annonces (laisse tout vide pour désactiver l'annonce)",
+    jour="Jour de l'annonce (par défaut : dimanche)",
+    heure="Heure de l'annonce, heure de Paris : 12h, 18h30, 20:15... (par défaut : 12h)",
+)
+@app_commands.choices(jour=[app_commands.Choice(name=j.capitalize(), value=i) for i, j in enumerate(JOURS)])
+async def cine_salon(
+    interaction: discord.Interaction,
+    salon: discord.TextChannel = None,
+    jour: app_commands.Choice[int] = None,
+    heure: str = None,
+):
     if not await _require_cine_admin(interaction):
         return
-    await interaction.response.defer(ephemeral=True)
-    if salon is None:
+
+    # Aucun argument : on désactive l'annonce.
+    if salon is None and jour is None and heure is None:
+        await interaction.response.defer(ephemeral=True)
         set_cine(interaction.guild_id, channel_id=None)
+        refresh_cine_schedule(interaction.guild_id)
         await interaction.followup.send("Annonce du Cinédimanche désactivée.", ephemeral=True)
         return
-    set_cine(interaction.guild_id, channel_id=salon.id)
+
+    parsed = None
+    if heure is not None:
+        parsed = parse_heure(heure)
+        if parsed is None:
+            await interaction.response.send_message(
+                "Heure invalide. Exemples : `12h`, `18h30`, `20:15`.", ephemeral=True
+            )
+            return
+
+    await interaction.response.defer(ephemeral=True)
+    cfg = get_cine_config(interaction.guild_id) or {}
+    fields = {}
+    if salon is not None:
+        fields["channel_id"] = salon.id
+    if jour is not None:
+        fields["announce_day"] = jour.value
+    if parsed is not None:
+        fields["announce_hour"], fields["announce_minute"] = parsed
+    # Si on ne change que le jour OU que l'heure, on fixe aussi l'autre valeur
+    # (par défaut ou déjà réglée) pour que le planning soit toujours complet.
+    day, hour, minute = cine_schedule_of({**cfg, **fields})
+    fields.update(announce_day=day, announce_hour=hour, announce_minute=minute)
+    set_cine(interaction.guild_id, **fields)
+    refresh_cine_schedule(interaction.guild_id)
+
+    cfg = get_cine_config(interaction.guild_id) or {}
+    if not cfg.get("channel_id"):
+        await interaction.followup.send(
+            f"Planning enregistré : {format_cine_schedule(cfg)}.\n"
+            "⚠️ Aucun salon défini : relance `/cine salon` avec le paramètre `salon`.",
+            ephemeral=True,
+        )
+        return
     await interaction.followup.send(
-        f"Le film sera annoncé dans {salon.mention} chaque dimanche à 12h ✅", ephemeral=True
+        f"Le film sera annoncé dans <#{cfg['channel_id']}> {format_cine_schedule(cfg)} (heure de Paris) ✅",
+        ephemeral=True,
     )
 
 
-@cine_group.command(name="film", description="Définir le film prévu ce soir (annoncé dimanche à 12h)")
+@cine_group.command(name="film", description="Définir le film prévu (annoncé à l'heure réglée avec /cine salon)")
 @app_commands.describe(
     titre="Titre du film (tu peux ajouter l'année : Alien (1979))",
     propose_par="Pseudo du viewer qui l'a proposé",
@@ -944,6 +1071,7 @@ async def cine_voir(interaction: discord.Interaction):
     )
     embed.add_field(name="Numéro", value=str(cfg["film_num"]) if cfg.get("film_num") else "*non défini*")
     embed.add_field(name="Salon", value=f"<#{cfg['channel_id']}>" if cfg.get("channel_id") else "*non configuré (désactivé)*")
+    embed.add_field(name="Annonce", value=f"{format_cine_schedule(cfg)} (heure de Paris)", inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -987,7 +1115,11 @@ async def on_ready():
     except Exception as e:
         print(f"Erreur de synchronisation des commandes : {e}")
 
-    # Boucle qui annonce le film du Cinédimanche chaque dimanche à 12h (Paris).
+    # Boucle qui annonce le film du Cinédimanche au jour et à l'heure choisis (Paris).
+    try:
+        load_cine_schedules()
+    except Exception:
+        traceback.print_exc()
     if not cine_announce_loop.is_running():
         cine_announce_loop.start()
 
