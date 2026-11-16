@@ -771,9 +771,9 @@ async def send_cine_announcement(cfg: dict) -> bool:
     numero = f" {num}" if num else ""
     texte = (
         "Ce soir, comme tous les dimanches, c'est ciné dimanche @everyone !\n\n"
-        "Qu'est-ce que le cinédimanche ? On regarde le film que VOUS avez choisi dimanche dernier "
-        "et à la fin du film, VOUS choisissez le film de dimanche prochain\n\n"
-        f"Ce soir le cinédimanche{numero} : {film}"
+        "Qu'est-ce que le cinédimanche ? On regarde le film que **VOUS** avez choisi dimanche dernier "
+        "et à la fin du film, **VOUS** choisissez le film de dimanche prochain\n\n"
+        f"Ce soir le cinédimanche{numero} : **{film}**"
     )
     # L'affiche (et « proposé par ») dans un embed sous le message
     poster = cfg.get("film_poster") or await fetch_poster(film)
