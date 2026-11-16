@@ -14,6 +14,13 @@ Commandes slash (/) :
     /bienvenue sticker-retirer   -> retire un autocollant du tirage
     /bienvenue apercu            -> prévisualise la configuration actuelle
 
+Annonce du Cinédimanche (chaque dimanche à 12h, heure de Paris) :
+    /cine salon                  -> salon de l'annonce (+ rôle à mentionner, texte de l'heure)
+    /cine film                   -> définit le film prévu ce soir
+    /cine voir                   -> affiche le film prévu et la configuration
+    /cine effacer                -> efface le film prévu
+    /cine annoncer               -> envoie l'annonce tout de suite (test)
+
 Les données sont stockées dans une base PostgreSQL externe (Neon, Supabase, ou
 tout autre Postgres compatible), configurée via la variable d'environnement
 DATABASE_URL. Contrairement à un fichier SQLite local, cette base survit aux
@@ -22,20 +29,25 @@ redéploiements et redémarrages, même sur les hébergeurs sans disque persista
 """
 
 import os
+import re
+import json
+import hmac
 import sys
 import random
 import asyncio
 import traceback
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
 import psycopg2
 import psycopg2.extras
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from aiohttp import web
+from aiohttp import web  # (aiohttp est aussi importé en entier ci-dessus pour TMDB)
 
 load_dotenv()
 
@@ -51,6 +63,16 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 EMBED_COLOR = 0x5865F2  # blurple
 
 DEFAULT_WELCOME_TEMPLATE = "Bienvenue {membre} sur **{serveur}** ! 🎉"
+
+# Annonce du Cinédimanche : chaque dimanche à 12h (heure de Paris). Si le bot
+# était éteint ou en veille à 12h pile, l'annonce part dès son retour, jusqu'à 18h.
+PARIS = ZoneInfo("Europe/Paris")
+CINE_HOUR = 12
+CINE_UNTIL_HOUR = 18
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")  # facultatif : affiche du film
+# Mot de passe partagé avec la page de la roue : elle l'envoie avec le film choisi
+# au vote (POST /cine). Sans cette variable, l'envoi depuis la page est désactivé.
+CINE_WEBHOOK_SECRET = os.getenv("CINE_WEBHOOK_SECRET")
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +134,21 @@ def init_db():
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cine_config (
+                guild_id BIGINT PRIMARY KEY,
+                channel_id BIGINT,
+                role_id BIGINT,
+                event_time TEXT,
+                film TEXT,
+                film_by TEXT,
+                film_num INTEGER,
+                film_poster TEXT,
+                last_announced DATE
+            )
+            """
+        )
         # Si la table existait déjà avant l'ajout de ces colonnes (mise à
         # jour du bot), on les ajoute proprement sans tout recréer.
         cur.execute(
@@ -120,6 +157,7 @@ def init_db():
         cur.execute(
             "ALTER TABLE welcome_config ADD COLUMN IF NOT EXISTS draftbot_channel_id BIGINT"
         )
+        cur.execute("ALTER TABLE cine_config ADD COLUMN IF NOT EXISTS film_poster TEXT")
 
 
 def is_known_member(guild_id: int, member_id: int) -> bool:
@@ -218,6 +256,43 @@ def get_welcome_stickers(guild_id: int) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+CINE_COLUMNS = {"channel_id", "role_id", "event_time", "film", "film_by", "film_num", "film_poster", "last_announced"}
+
+
+def get_cine_config(guild_id: int) -> dict | None:
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM cine_config WHERE guild_id = %s", (guild_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def set_cine(guild_id: int, **fields):
+    """Met à jour uniquement les colonnes données (liste blanche CINE_COLUMNS)."""
+    cols = [c for c in fields if c in CINE_COLUMNS]
+    if not cols:
+        return
+    names = ", ".join(cols)
+    placeholders = ", ".join(["%s"] * len(cols))
+    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols)
+    with get_db() as db, db.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO cine_config (guild_id, {names}) VALUES (%s, {placeholders}) "
+            f"ON CONFLICT (guild_id) DO UPDATE SET {updates}",
+            (guild_id, *[fields[c] for c in cols]),
+        )
+
+
+def get_due_cine(today) -> list[dict]:
+    """Serveurs avec un salon et un film définis, pas encore annoncés aujourd'hui."""
+    with get_db() as db, db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM cine_config WHERE channel_id IS NOT NULL AND film IS NOT NULL "
+            "AND (last_announced IS NULL OR last_announced <> %s)",
+            (today,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 # ---------------------------------------------------------------------------
 # Bot
 # ---------------------------------------------------------------------------
@@ -280,8 +355,10 @@ async def start_fake_webserver():
     Discord lui-même n'a besoin d'aucun port : toute sa communication passe
     par une connexion sortante vers l'API Discord (le "gateway").
     """
-    app = web.Application()
+    app = web.Application(client_max_size=8 * 1024)
     app.router.add_get("/", _health_handler)
+    app.router.add_post("/cine", _cine_post)
+    app.router.add_route("OPTIONS", "/cine", _cine_options)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -651,6 +728,268 @@ async def bienvenue_apercu(interaction: discord.Interaction):
 bot.tree.add_command(welcome_group)
 
 
+# ---------------------------------------------------------------------------
+# Annonce du Cinédimanche
+# ---------------------------------------------------------------------------
+
+async def fetch_poster(title: str) -> str | None:
+    """Cherche l'affiche sur TMDB (facultatif : ignoré sans TMDB_API_KEY)."""
+    if not TMDB_API_KEY:
+        return None
+    try:
+        m = re.match(r"^(.*?)[\s(\[]*((?:19|20)\d\d)[)\]]?\s*$", title)
+        query, year = (m.group(1).strip(), m.group(2)) if m and m.group(1).strip() else (title.strip(), "")
+        params = {"include_adult": "false", "language": "fr-FR", "query": query}
+        if year:
+            params["year"] = year
+        headers = {}
+        if len(TMDB_API_KEY) > 40:
+            headers["Authorization"] = f"Bearer {TMDB_API_KEY}"
+        else:
+            params["api_key"] = TMDB_API_KEY
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.get("https://api.themoviedb.org/3/search/movie", params=params, headers=headers) as r:
+                if r.status != 200:
+                    return None
+                results = (await r.json()).get("results") or []
+        hit = next((x for x in results if x.get("poster_path")), None)
+        return f"https://image.tmdb.org/t/p/w500{hit['poster_path']}" if hit else None
+    except Exception as e:
+        print(f"[cine] Affiche TMDB introuvable : {e!r}")
+        return None
+
+
+async def send_cine_announcement(cfg: dict) -> bool:
+    """Poste l'annonce du film prévu, puis efface le film (pour ne pas le re-annoncer)."""
+    channel = bot.get_channel(cfg["channel_id"])
+    if channel is None:
+        print(f"[cine] Salon {cfg['channel_id']} introuvable (serveur {cfg['guild_id']}) — abandon.")
+        return False
+
+    film = cfg["film"]
+    num = cfg.get("film_num")
+    quand = cfg.get("event_time") or "ce soir"
+    embed = discord.Embed(
+        title=f"🎬 Cinédimanche n°{num}" if num else "🎬 Cinédimanche",
+        description=f"**{film}**\n{quand}",
+        color=EMBED_COLOR,
+    )
+    if cfg.get("film_by"):
+        embed.set_footer(text=f"Proposé par {cfg['film_by']}")
+    poster = cfg.get("film_poster") or await fetch_poster(film)
+    if poster:
+        embed.set_image(url=poster)
+
+    role_id = cfg.get("role_id")
+    try:
+        await channel.send(
+            content=f"<@&{role_id}>" if role_id else None,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=role_id)] if role_id else []),
+        )
+    except discord.Forbidden:
+        print(f"[cine] Permission refusée pour envoyer dans #{channel.name}.")
+        return False
+
+    set_cine(cfg["guild_id"], film=None, film_by=None, film_num=None, film_poster=None, last_announced=datetime.now(PARIS).date())
+    print(f"[cine] Annonce envoyée dans #{channel.name} : {film}")
+    return True
+
+
+@tasks.loop(minutes=1)
+async def cine_announce_loop():
+    """Vérifie chaque minute s'il est temps d'annoncer (dimanche 12h-18h, heure de Paris).
+    En dehors de cette plage, aucune requête n'est faite à la base."""
+    try:
+        now = datetime.now(PARIS)
+        if now.weekday() != 6 or not (CINE_HOUR <= now.hour < CINE_UNTIL_HOUR):
+            return
+        for cfg in await asyncio.to_thread(get_due_cine, now.date()):
+            # Marqué comme annoncé AVANT l'envoi, pour qu'un échec ne boucle pas toutes les minutes.
+            await asyncio.to_thread(set_cine, cfg["guild_id"], last_announced=now.date())
+            await send_cine_announcement(cfg)
+    except Exception:
+        traceback.print_exc()
+
+
+@cine_announce_loop.before_loop
+async def _before_cine_loop():
+    await bot.wait_until_ready()
+
+
+def _cors(resp: web.Response) -> web.Response:
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    return resp
+
+
+def _reply(status: int, ok: bool, error: str = "") -> web.Response:
+    return _cors(web.json_response({"ok": ok, "error": error}, status=status))
+
+
+async def _cine_options(request: web.Request) -> web.Response:
+    return _cors(web.Response(status=204))
+
+
+async def _cine_post(request: web.Request) -> web.Response:
+    """Reçoit le film choisi au vote depuis la page de la roue.
+    Corps JSON (envoyé en text/plain pour éviter une requête de pré-vérification CORS) :
+    {secret, film, by, num, poster, guild_id}"""
+    if not CINE_WEBHOOK_SECRET:
+        return _reply(404, False, "Envoi depuis la page désactivé (CINE_WEBHOOK_SECRET absent).")
+    try:
+        data = json.loads(await request.text())
+    except ValueError:
+        return _reply(400, False, "Requête illisible.")
+    if not isinstance(data, dict) or not hmac.compare_digest(
+        str(data.get("secret", "")).encode(), CINE_WEBHOOK_SECRET.encode()
+    ):
+        return _reply(401, False, "Mot de passe incorrect.")
+
+    film = str(data.get("film") or "").strip()[:100]
+    if not film:
+        return _reply(400, False, "Film manquant.")
+    by = str(data.get("by") or "").strip()[:40] or None
+    try:
+        num = int(data.get("num") or 0)
+    except (TypeError, ValueError):
+        num = 0
+    num = num if 1 <= num <= 9999 else None
+    poster = str(data.get("poster") or "")
+    if not poster.startswith("https://image.tmdb.org/t/p/") or len(poster) > 300:
+        poster = None
+
+    gid = str(data.get("guild_id") or "").strip()
+    if gid.isdigit():
+        guild = bot.get_guild(int(gid))
+    else:
+        guild = bot.guilds[0] if len(bot.guilds) == 1 else None
+    if guild is None:
+        return _reply(400, False, "Serveur introuvable : renseigne l'ID du serveur Discord dans la page.")
+
+    await asyncio.to_thread(set_cine, guild.id, film=film, film_by=by, film_num=num, film_poster=poster)
+    print(f"[cine] Film reçu depuis la page : {film} (n°{num}, par {by}) pour {guild.name}")
+    return _reply(200, True)
+
+
+cine_group = app_commands.Group(name="cine", description="Annonce du Cinédimanche (dimanche 12h)")
+
+
+async def _require_cine_admin(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
+        return False
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "Il te faut la permission \"Gérer le serveur\" pour gérer le Cinédimanche.", ephemeral=True
+        )
+        return False
+    return True
+
+
+@cine_group.command(name="salon", description="Définir le salon où le film est annoncé chaque dimanche à 12h")
+@app_commands.describe(
+    salon="Le salon des annonces (laisse vide pour désactiver)",
+    role="Rôle à mentionner dans l'annonce (facultatif)",
+    heure="Texte de l'heure, ex : ce soir à 21h (facultatif)",
+)
+async def cine_salon(
+    interaction: discord.Interaction,
+    salon: discord.TextChannel = None,
+    role: discord.Role = None,
+    heure: app_commands.Range[str, 1, 60] = None,
+):
+    if not await _require_cine_admin(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    if salon is None:
+        set_cine(interaction.guild_id, channel_id=None)
+        await interaction.followup.send("Annonce du Cinédimanche désactivée.", ephemeral=True)
+        return
+    fields = {"channel_id": salon.id}
+    if role is not None:
+        fields["role_id"] = role.id
+    if heure is not None:
+        fields["event_time"] = heure
+    set_cine(interaction.guild_id, **fields)
+    await interaction.followup.send(
+        f"Le film sera annoncé dans {salon.mention} chaque dimanche à 12h ✅", ephemeral=True
+    )
+
+
+@cine_group.command(name="film", description="Définir le film prévu ce soir (annoncé dimanche à 12h)")
+@app_commands.describe(
+    titre="Titre du film (tu peux ajouter l'année : Alien (1979))",
+    propose_par="Pseudo du viewer qui l'a proposé",
+    numero="Numéro du Cinédimanche",
+)
+async def cine_film(
+    interaction: discord.Interaction,
+    titre: app_commands.Range[str, 1, 100],
+    propose_par: app_commands.Range[str, 1, 40] = None,
+    numero: app_commands.Range[int, 1, 9999] = None,
+):
+    if not await _require_cine_admin(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    set_cine(interaction.guild_id, film=titre.strip(), film_by=propose_par, film_num=numero, film_poster=None)
+    cfg = get_cine_config(interaction.guild_id)
+    suite = "" if cfg and cfg.get("channel_id") else "\n⚠️ Aucun salon défini : utilise `/cine salon`."
+    await interaction.followup.send(f"Film enregistré : **{titre.strip()}** ✅{suite}", ephemeral=True)
+
+
+@cine_group.command(name="voir", description="Voir le film prévu et la configuration de l'annonce")
+async def cine_voir(interaction: discord.Interaction):
+    if not await _require_cine_admin(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    cfg = get_cine_config(interaction.guild_id) or {}
+    film = cfg.get("film")
+    embed = discord.Embed(title="Cinédimanche", color=EMBED_COLOR)
+    embed.add_field(
+        name="Film prévu",
+        value=(f"**{film}**" + (f" (proposé par {cfg['film_by']})" if cfg.get("film_by") else "")) if film else "*aucun*",
+        inline=False,
+    )
+    embed.add_field(name="Numéro", value=str(cfg["film_num"]) if cfg.get("film_num") else "*non défini*")
+    embed.add_field(name="Salon", value=f"<#{cfg['channel_id']}>" if cfg.get("channel_id") else "*non configuré (désactivé)*")
+    embed.add_field(name="Rôle mentionné", value=f"<@&{cfg['role_id']}>" if cfg.get("role_id") else "*aucun*")
+    embed.add_field(name="Texte de l'heure", value=cfg.get("event_time") or "ce soir")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@cine_group.command(name="effacer", description="Effacer le film prévu")
+async def cine_effacer(interaction: discord.Interaction):
+    if not await _require_cine_admin(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    set_cine(interaction.guild_id, film=None, film_by=None, film_num=None, film_poster=None)
+    await interaction.followup.send("Film prévu effacé.", ephemeral=True)
+
+
+@cine_group.command(name="annoncer", description="Envoyer l'annonce tout de suite (test)")
+async def cine_annoncer(interaction: discord.Interaction):
+    if not await _require_cine_admin(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    cfg = get_cine_config(interaction.guild_id)
+    if not cfg or not cfg.get("channel_id"):
+        await interaction.followup.send("Aucun salon défini : utilise d'abord `/cine salon`.", ephemeral=True)
+        return
+    if not cfg.get("film"):
+        await interaction.followup.send("Aucun film défini : utilise d'abord `/cine film`.", ephemeral=True)
+        return
+    ok = await send_cine_announcement(cfg)
+    await interaction.followup.send(
+        "Annonce envoyée ✅ (le film prévu a été effacé)." if ok else "Envoi impossible (salon introuvable ou permission manquante).",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(cine_group)
+
+
 @bot.event
 async def on_ready():
     init_db()
@@ -660,10 +999,14 @@ async def on_ready():
     except Exception as e:
         print(f"Erreur de synchronisation des commandes : {e}")
 
+    # Boucle qui annonce le film du Cinédimanche chaque dimanche à 12h (Paris).
+    if not cine_announce_loop.is_running():
+        cine_announce_loop.start()
+
     # Le serveur factice n'est utile que si l'hébergeur fournit un PORT
     # (c'est le cas de Render en Web Service). En local, on l'ignore.
     global _webserver_started
-    if not _webserver_started and os.getenv("PORT"):
+    if not _webserver_started and (os.getenv("PORT") or CINE_WEBHOOK_SECRET):
         _webserver_started = True
         asyncio.create_task(start_fake_webserver())
 
