@@ -15,7 +15,7 @@ Commandes slash (/) :
     /bienvenue apercu            -> prévisualise la configuration actuelle
 
 Annonce du Cinédimanche (chaque dimanche à 12h, heure de Paris) :
-    /cine salon                  -> salon de l'annonce (+ rôle à mentionner, texte de l'heure)
+    /cine salon                  -> salon de l'annonce
     /cine film                   -> définit le film prévu ce soir
     /cine voir                   -> affiche le film prévu et la configuration
     /cine effacer                -> efface le film prévu
@@ -768,24 +768,28 @@ async def send_cine_announcement(cfg: dict) -> bool:
 
     film = cfg["film"]
     num = cfg.get("film_num")
-    quand = cfg.get("event_time") or "ce soir"
-    embed = discord.Embed(
-        title=f"🎬 Cinédimanche n°{num}" if num else "🎬 Cinédimanche",
-        description=f"**{film}**\n{quand}",
-        color=EMBED_COLOR,
+    numero = f" {num}" if num else ""
+    texte = (
+        "Ce soir, comme tous les dimanches, c'est ciné dimanche @everyone !\n\n"
+        "Qu'est-ce que le cinédimanche ? On regarde le film que VOUS avez choisi dimanche dernier "
+        "et à la fin du film, VOUS choisissez le film de dimanche prochain\n\n"
+        f"Ce soir le cinédimanche{numero} : {film}"
     )
-    if cfg.get("film_by"):
-        embed.set_footer(text=f"Proposé par {cfg['film_by']}")
+    # L'affiche (et « proposé par ») dans un embed sous le message
     poster = cfg.get("film_poster") or await fetch_poster(film)
-    if poster:
-        embed.set_image(url=poster)
+    embed = None
+    if poster or cfg.get("film_by"):
+        embed = discord.Embed(color=EMBED_COLOR)
+        if poster:
+            embed.set_image(url=poster)
+        if cfg.get("film_by"):
+            embed.set_footer(text=f"Proposé par {cfg['film_by']}")
 
-    role_id = cfg.get("role_id")
     try:
         await channel.send(
-            content=f"<@&{role_id}>" if role_id else None,
+            content=texte,
             embed=embed,
-            allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=role_id)] if role_id else []),
+            allowed_mentions=discord.AllowedMentions(everyone=True),
         )
     except discord.Forbidden:
         print(f"[cine] Permission refusée pour envoyer dans #{channel.name}.")
@@ -889,17 +893,8 @@ async def _require_cine_admin(interaction: discord.Interaction) -> bool:
 
 
 @cine_group.command(name="salon", description="Définir le salon où le film est annoncé chaque dimanche à 12h")
-@app_commands.describe(
-    salon="Le salon des annonces (laisse vide pour désactiver)",
-    role="Rôle à mentionner dans l'annonce (facultatif)",
-    heure="Texte de l'heure, ex : ce soir à 21h (facultatif)",
-)
-async def cine_salon(
-    interaction: discord.Interaction,
-    salon: discord.TextChannel = None,
-    role: discord.Role = None,
-    heure: app_commands.Range[str, 1, 60] = None,
-):
+@app_commands.describe(salon="Le salon des annonces (laisse vide pour désactiver)")
+async def cine_salon(interaction: discord.Interaction, salon: discord.TextChannel = None):
     if not await _require_cine_admin(interaction):
         return
     await interaction.response.defer(ephemeral=True)
@@ -907,12 +902,7 @@ async def cine_salon(
         set_cine(interaction.guild_id, channel_id=None)
         await interaction.followup.send("Annonce du Cinédimanche désactivée.", ephemeral=True)
         return
-    fields = {"channel_id": salon.id}
-    if role is not None:
-        fields["role_id"] = role.id
-    if heure is not None:
-        fields["event_time"] = heure
-    set_cine(interaction.guild_id, **fields)
+    set_cine(interaction.guild_id, channel_id=salon.id)
     await interaction.followup.send(
         f"Le film sera annoncé dans {salon.mention} chaque dimanche à 12h ✅", ephemeral=True
     )
@@ -954,8 +944,6 @@ async def cine_voir(interaction: discord.Interaction):
     )
     embed.add_field(name="Numéro", value=str(cfg["film_num"]) if cfg.get("film_num") else "*non défini*")
     embed.add_field(name="Salon", value=f"<#{cfg['channel_id']}>" if cfg.get("channel_id") else "*non configuré (désactivé)*")
-    embed.add_field(name="Rôle mentionné", value=f"<@&{cfg['role_id']}>" if cfg.get("role_id") else "*aucun*")
-    embed.add_field(name="Texte de l'heure", value=cfg.get("event_time") or "ce soir")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
