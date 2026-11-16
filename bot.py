@@ -342,6 +342,16 @@ def current_cine_slot(now: datetime, schedule: tuple[int, int, int]):
     return None
 
 
+def next_cine_slot(now: datetime, schedule: tuple[int, int, int]) -> datetime:
+    """Prochain moment d'annonce (maintenant inclus si on est dans la fenêtre)."""
+    day, hour, minute = schedule
+    for ahead in range(0, 8):
+        slot = (now + timedelta(days=ahead)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if slot.weekday() == day and slot + timedelta(hours=CINE_WINDOW_HOURS) > now:
+            return slot
+    return now
+
+
 def get_due_cine(guild_ids: list[int], slot_dates: dict[int, object]) -> list[dict]:
     """Serveurs (parmi guild_ids) avec salon et film définis, pas encore annoncés pour ce créneau."""
     if not guild_ids:
@@ -858,8 +868,7 @@ async def send_cine_announcement(cfg: dict) -> bool:
         print(f"[cine] Permission refusée pour envoyer dans #{channel.name}.")
         return False
 
-    slot_date = current_cine_slot(datetime.now(PARIS), cine_schedule_of(cfg)) or datetime.now(PARIS).date()
-    set_cine(cfg["guild_id"], film=None, film_by=None, film_num=None, film_poster=None, last_announced=slot_date)
+    set_cine(cfg["guild_id"], film=None, film_by=None, film_num=None, film_poster=None)
     print(f"[cine] Annonce envoyée dans #{channel.name} : {film}")
     return True
 
@@ -1071,7 +1080,26 @@ async def cine_voir(interaction: discord.Interaction):
     )
     embed.add_field(name="Numéro", value=str(cfg["film_num"]) if cfg.get("film_num") else "*non défini*")
     embed.add_field(name="Salon", value=f"<#{cfg['channel_id']}>" if cfg.get("channel_id") else "*non configuré (désactivé)*")
-    embed.add_field(name="Annonce", value=f"{format_cine_schedule(cfg)} (heure de Paris)", inline=False)
+    now = datetime.now(PARIS)
+    schedule = cine_schedule_of(cfg)
+    prochaine = next_cine_slot(now, schedule)
+    etat = []
+    if not cfg.get("channel_id"):
+        etat.append("⚠️ aucun salon défini")
+    if not film:
+        etat.append("⚠️ aucun film défini")
+    if cfg.get("last_announced") == prochaine.date():
+        etat.append("⚠️ déjà annoncé pour ce créneau (le prochain sera le suivant)")
+    embed.add_field(
+        name="Annonce",
+        value=(
+            f"{format_cine_schedule(cfg)} (heure de Paris)\n"
+            f"Prochain créneau : {prochaine.strftime('%d/%m à %Hh%M')}\n"
+            f"Heure actuelle du bot : {now.strftime('%d/%m %Hh%M')}\n"
+            + ("\n".join(etat) if etat else "✅ tout est prêt")
+        ),
+        inline=False,
+    )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -1118,6 +1146,7 @@ async def on_ready():
     # Boucle qui annonce le film du Cinédimanche au jour et à l'heure choisis (Paris).
     try:
         load_cine_schedules()
+        print(f"[cine] Planning chargé : {CINE_SCHEDULES}")
     except Exception:
         traceback.print_exc()
     if not cine_announce_loop.is_running():
